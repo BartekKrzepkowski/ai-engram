@@ -19,6 +19,15 @@
   Forget Quality. The eight trained baselines (GradDiff, IdkNLL, UNDIAL, RMU,
   AltPO, NPO, SimNPO, IdkDPO) are not replicated; where a report shows them,
   their numbers are quoted from the paper and marked as not replicated.
+- Second campaign (user decision, 2026-10-22): **ReCAST on the same TOFU
+  setup**, a port of the ReCAST method of the user's `unlearning-svd`
+  repository (`SEMU/Classification`, unrestricted and restricted with the SEMU
+  adapter backend) to Llama-3.2-1B-Instruct. Its specification is
+  `SEMU/Classification/docs/RECAST_PORTING_CONTRACT.md` in that repository,
+  with the Classification code as the behavioral reference. Campaign tag
+  `recast_tofu_comparison`; its rows are scored against the Table 3 anchors
+  but reported separately from the method-faithful replication, never merged
+  into Table 3 without explicit stratification.
 - `origin` is the author's repository. Never push to it.
 - When the user asks to create or switch to a branch and/or worktree, treat that
   branch-worktree pair as the persistent active workspace. Before subsequent
@@ -95,6 +104,11 @@
   follow; do not silently pick one.
 - Do not silently fix upstream bugs. A fix changes what is being replicated:
   propose it, and record it as a deviation once the user agrees.
+- The ReCAST port follows the porting contract and the Classification code;
+  each language-model adaptation and each phase-two choice that differs from
+  the canonical Classification protocol is a `Deviation:` entry. A port is
+  called ReCAST only while the contract's parity tests
+  (`replication/tests/test_recast_core.py`) pass.
 - The upstream `tofu` extra in `pyproject.toml` omits `scikit-learn`, which
   `engram.benchmarks._tofu_official` imports. Install the environment from the
   spec in `replication/environment/`, never from the upstream extras alone.
@@ -105,6 +119,9 @@
   launchers in `replication/scripts/bash/<workflow>/`, Python commands in
   `replication/scripts/`, agent guides and the work log in `replication/docs/`.
   `replication/logs` is a symlink to storage (`CLUSTER_ENVIRONMENT.md`).
+  The ReCAST port is the library `replication/scripts/recast_core.py`, the
+  command `replication/scripts/recast_tofu.py` and the tests
+  `replication/tests/test_recast_core.py`.
 - The package is installed into the environment editable from this checkout
   without dependencies, so a job runs the checked-out code with the pinned
   dependencies. Every run records the git commit and branch it ran.

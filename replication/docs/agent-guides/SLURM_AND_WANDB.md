@@ -75,7 +75,10 @@ Binding with the same authority as `AGENTS.md`.
 - **Matched** -- any comparison where methods share one protocol (same model,
   split, reference set, evaluation code). Only explicit method-specific
   mechanisms and declared sweep axes may differ. It gets its own campaign tag
-  and protocol name.
+  and protocol name. The ReCAST port on TOFU is one: campaign tag
+  `recast_tofu_comparison`, same model, splits, anchors and evaluation code as
+  Table 3, phase two on the OpenUnlearning TOFU trainer recipe; its sweep axes
+  are the variant and the shrink floor.
 
 Never place results of both types in one table without clearly marking the
 protocol mismatch. Before submission, report both the shared settings and
