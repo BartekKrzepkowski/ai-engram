@@ -29,3 +29,8 @@ pytest==8.4.2
 # Replication: experiment logging. Version already working against the W&B
 # server from these nodes (reload-llm-gh200).
 wandb==0.26.1
+
+# ReCAST comparison: the Hugging Face Trainer of phase two requires
+# accelerate>=0.26 (pilot 24955489_0 failed without it). Pure Python; its
+# compiled dependency psutil is already installed through wandb.
+accelerate==1.10.1

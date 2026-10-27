@@ -101,9 +101,15 @@ from engram.benchmarks import _tofu_official  # noqa: F401  -- rouge_score, skle
 
 print(f"[smoke] engram=={engram.__version__} from {engram.__file__}")
 for name in ["transformers", "datasets", "huggingface_hub", "scipy", "sklearn",
-             "numpy", "rouge_score", "wandb", "pytest"]:
+             "numpy", "rouge_score", "wandb", "pytest", "accelerate"]:
     module = importlib.import_module(name)
     print(f"[smoke] {name}=={getattr(module, '__version__', '?')}")
+
+# The ReCAST phase two builds a Trainer; TrainingArguments alone checks for accelerate.
+import tempfile
+from transformers import TrainingArguments
+TrainingArguments(output_dir=tempfile.mkdtemp(), report_to=[])
+print("[smoke] transformers.TrainingArguments constructed")
 PY
 )
 
