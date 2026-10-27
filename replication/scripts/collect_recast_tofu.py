@@ -18,13 +18,15 @@ import os
 import statistics
 
 COLUMNS = ["Memorization", "Utility", "Privacy", "EM", "FQ", "Overall"]
-# eval_trajectory only adds evaluations of copies; the trained model is the same
-BOOKKEEPING = {"seed", "out_dir", "run_name", "wandb_tags", "wandb_mode", "wandb_project", "anchors_raw", "eval_trajectory"}
-SHOWN = ["variant", "targets", "target_blocks", "s_min", "restriction_evr", "restriction_source",
+# eval_trajectory, component_diagnostics and save_model_dir only add measurements or files; the trained model is the same
+BOOKKEEPING = {"seed", "out_dir", "run_name", "wandb_tags", "wandb_mode", "wandb_project", "anchors_raw", "eval_trajectory",
+               "component_diagnostics", "save_model_dir"}
+SHOWN = ["base_id", "variant", "targets", "target_blocks", "s_min", "restriction_evr", "restriction_source",
          "restriction_alignment_scope", "shrink_layer_scaling", "phase2_free", "untie_lm_head", "train_lm_head", "lr",
          "lr_scheduler", "lr_points", "epochs", "max_grad_norm", "retain_loss", "kl_weight", "retain_input_filter",
          "retain_filter_kappa", "restriction_whitening", "whitening_rho", "restriction_representation",
-         "representation_mix", "restriction_rank_multiplier", "restriction_forget_output_target"]
+         "representation_mix", "restriction_rank_multiplier", "restriction_forget_output_target", "component_selection",
+         "warm_start_scale", "warm_start_scale_target", "warm_start_scale_by_type", "direction_weighting"]
 
 
 def parse_args():
@@ -99,7 +101,9 @@ def main():
               f"filter={c['retain_input_filter'] or 'none'}{'' if c['retain_filter_kappa'] is None else c['retain_filter_kappa']} "
               f"whiten={c['restriction_whitening'] or 'none'}{'' if c['whitening_rho'] is None else c['whitening_rho']} "
               f"repr={c['restriction_representation'] or 'none'}{'' if c['representation_mix'] is None else '/mix' + str(c['representation_mix'])} "
-              f"rankx={c['restriction_rank_multiplier'] or '-'} qf={c['restriction_forget_output_target'] or '-'}"
+              f"rankx={c['restriction_rank_multiplier'] or '-'} qf={c['restriction_forget_output_target'] or '-'} "
+              f"components={c['component_selection'] or '-'} scale={c['warm_start_scale_target'] or c['warm_start_scale'] or '-'} "
+              f"dirw={c['direction_weighting'] or '-'}"
               + (f" (repeats dropped: {', '.join(r['repeats_dropped'])})" if r["repeats_dropped"] else ""))
         print("    " + "  ".join(f"{col} {r['stats'][col]['mean']:.4f}±{r['stats'][col]['std']:.4f}" for col in COLUMNS))
         print("    Overall per seed: " + ", ".join(f"{v:.4f}" for v in r["stats"]["Overall"]["values"]))

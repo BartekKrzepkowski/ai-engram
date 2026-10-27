@@ -1377,3 +1377,327 @@ deviation from the paper or upstream code.
   0.9155 +- 0.0061).
   Finding: one EVR threshold at m 1 reproduces the m-scaled budgets within seed noise, so the rank multiplier is not
   needed as a second hyperparameter; the EVR alone sets the budget (0.996 for down_proj only, 0.98 for down_up_o).
+- [x] 04:40 Decision (user): Experiment 1 of the retain-aware ReCAST plan, adapted to this code: decompose the D update
+  into Frobenius-orthogonal components, diagnose their first-order forget contributions, and test a signed shrink
+  (keep only components with c_j > 0) against a random control with as many components and a uniform shrink of the
+  original update to the same norm; everything else fixed; stop after implementing and validating.
+- [x] 04:40 Equations of the current code (basis D, down_up_o reference run): per target W (out x in), retain and
+  forget mean gradients G_r, G_f at Init Fine. (example-weighted means of batch-mean answer NLL, model in eval
+  mode); row shrink S = diag(s_i), s_i = max(cos(W_i, -G_r,i), s_min) (all rows at the floor s_min 0.3 in practice);
+  proposal X = S W - W; reference rank r0 = smallest k with cumulative energy of the SVD of G_f >= EVR (0.97), rank
+  r = round(m r0) (m 1.25); input basis Vh (r x in): QR of (C_r + eps I)^-1/2 times the top-r eigenvectors of
+  (C_r + eps I)^-1/2 C_f/tr(C_f) (C_r + eps I)^-1/2, eps = rho tr(C_r) / in (rho 30), C the uncentred answer-token
+  input covariances; output basis U: left singular vectors of G_f Vh^T (min(r, out) columns); update
+  Delta W_D = U U^T X Vh^T Vh, W* = W + Delta W_D, applied once per target, every target from the Init Fine.
+  weights and gradients; then the SEMU adapter W = anchor + U A Vh (A0 = U^T W* Vh^T) and phase two.
+- [x] 04:40 Code (signed shrink): `recast_core.decompose_update` (core B = U^T X Vh^T, thin SVD B = P Sigma Q^T in fp64,
+  D_j = sigma_j (U p_j)(Vh^T q_j)^T, c_j = sigma_j p_j^T (U^T G_f Vh^T) q_j), `compose_update`, `component_weights`
+  (full / signed / random with as many ones as signed, seeded by --seed and the target name / uniform_matched gamma =
+  ||signed|| / ||Delta W_D|| per target, 0 for a zero update), `effective_rank` (Roy-Vetterli), `component_report`;
+  `warm_start(component_selection, component_diagnostics, component_seed)` replaces the projected update only when a
+  selection is given (uniform_matched scales the original update itself). `recast_tofu.py --component_selection`,
+  `--component_diagnostics yes` (components.json with sigma and c_j per target; forget / retain loss before and after
+  the warm start against the summed <G_f, Delta W> and <G_r, Delta W>, absolute and relative errors, None below 1e-8)
+  with controls (reconstruction error <= 1e-4, sum c_j = <G_f, Delta W_D>, kept counts), CUDA peak memory in
+  results; collector shows the mode (diagnostics as bookkeeping); launcher axis COMPONENT_MODES and
+  COMPONENT_DIAGNOSTICS from --export; `component_report.py` + `component_report_gh200.sh` (mode x stage table and
+  the numbers behind the six diagnostic questions). Eight tests (reconstruction incl. a free output side,
+  contributions and their sum, orthogonality and energy, signed mask and equal-norm matching, zero gradient / zero
+  update, small singular values, deterministic random control, default and full modes reproduce the old update).
+  SHA-256 prefixes recast_core, recast_tofu, collect_recast_tofu, component_report, tests: 2aa5bdc9 88146243 f95c5f6a
+  c2eb3c08 61135738 . Gate: `py_compile`, `bash -n`; test job 25243735 (04:49): 41 passed in 33.6 s.
+  Launcher axes set for the experiment (D rho 30 gradient side, down_up_o, s_min 0.3, EVR 0.97, m 1.25, seed 0,
+  COMPONENT_MODES none / full / signed / random / uniform_matched); no experiment submitted.
+- [x] 05:03 Decision (user): run the signed-shrink experiment with phase two as free training of every parameter, no
+  adapter (the restriction belongs to phase one only): `--variant restricted_shrink`. The earlier D rows (0.9155, and
+  down_proj only 0.923) used restricted_semu free_all, a different variant; the mode `none` below is this
+  experiment's baseline.
+- [ ] 05:03 Signed shrink, warm start only (EPOCHS=0, COMPONENT_DIAGNOSTICS=yes), restricted_shrink, D rho 30 gradient
+  side, down_up_o, s_min 0.3, EVR 0.97, m 1.25: array 25243917 (none / full / signed / uniform_matched, seed 0; the
+  warm start is deterministic) and array 25243918 (random, seeds 0 / 1 / 2). Phase two with three seeds follows once
+  the numerical controls pass.
+  Result (05:10): all seven FAILED after 5:47-6:05 at the component control, every task at
+  model.layers.1.mlp.down_proj. Debug job 25244020 (scratchpad script, that target alone, 3:05): rank 1 (EVR rank
+  1), one component with c_j < 0, update norm 1.229e-5, reconstruction relative error 6.4e-4 (absolute 7.9e-9),
+  sum c_j -2.8375e-7 against <G_f, P(X)> -2.8356e-7, ||G_f|| 2.07. Cause: the fp32 core U^T X Vh^T of an update that
+  nearly vanishes against a proposal of norm ~0.7 ||W|| loses most relative digits (cancellation over 16.8M terms);
+  the fp64 components are the more accurate ones. The relative 1e-4 threshold was the wrong control for such
+  targets.
+- [x] 05:13 Code: component control scaled to fp32 rounding: ||P(X) - sum D_j|| <= 1e-5 ||X|| and |sum c_j - <G_f, P(X)>|
+  <= ||G_f|| ||P(X) - sum D_j|| + 1e-6 |<G_f, P(X)>| + 1e-12 (Cauchy-Schwarz); the error message gives the values;
+  `component_report` adds the absolute reconstruction error and ||G_f||; test for a near-zero fp32 update added.
+  No task pending. SHA-256 prefixes recast_core, recast_tofu, tests: ce069052 b87542bd 5b192c24 . Gate: `py_compile`;
+  the parity tests run in each task.
+- [x] 05:14 Resubmitted as array 25244062 (none / full / signed / uniform_matched, seed 0) and array 25244063 (random,
+  seeds 0 / 1 / 2), otherwise as 25243917 / 25243918.
+  Result (05:31): all seven COMPLETED (10:33-16:08); 42 parity tests passed in each; component controls passed (largest
+  reconstruction error at layers.1.down_proj, relative 6.42e-4, absolute 7.89e-9 on an update of norm 1.23e-5);
+  capture control passed. Decomposition of the original D update (31649 components over 48 targets): 15481 with
+  c_j > 0 holding 0.4879 of the energy, c_j < 0 0.5121; by type, energy with c_j < 0: o_proj 0.5264 (2934 of 5956
+  positive), up_proj 0.4992 (6346 of 12580), down_proj 0.5216 (6201 of 13113); sum c_j = <G_f, Delta W_D> = -0.0820
+  (+0.6446, -0.7266). Applied norm / effective rank (mean over targets): none and full 57.29 / 518.5; signed 40.02 /
+  253.2 (energy 0.4879); uniform_matched 40.02 / 518.5; random seeds 0 / 1 / 2 40.09 / 40.35 / 40.16, 253.2-253.7
+  (energy 0.490-0.496; layers.1.down_proj keeps no component under signed, random and gamma = 0). Forget / retain
+  loss (batch-mean NLL as the gradients) 0.1352 / 0.1311 at Init Fine.; actual change vs <G, Delta W>: none and full
+  +10.967 vs -0.0820 / +10.347 vs -0.0671 (rel. errors 135 / 155); signed +1.492 vs +0.6446 / +1.161 vs +0.1882
+  (1.31 / 5.17); uniform_matched +6.478 vs -0.0503 / +5.390 vs -0.0447 (130 / 122); random seeds 0 / 1 / 2 forget
+  +4.373 / +7.290 / +4.248, retain +3.557 / +6.268 / +3.493 (rel. errors 113-164). Warm-start-only Mem / Util / Priv
+  / EM / FQ / Overall; real-authors ROUGE: none 0 / 0.0012 / 0 / 1 / -12.03 / 0, 0.013; full 0 / 0 / 0 / 1 / -12.99
+  / 0, 0.000; signed 0.8405 / 0.8227 / 0.1151 / 0.0860 / -4.16 / 0.2705, 0.517; uniform_matched 0.0649 / 0.0460 /
+  0.0343 / 0.9828 / -2.31 / 0.0452, 0.009; random seed 0 0.6577 / 0.1992 / 0.2236 / 0.6262 / -0.88 / 0.2724, 0.058;
+  seed 1 0 / 0.0541 / 0.0261 / 1 / -3.11 / 0, 0.033; seed 2 0.7485 / 0.2012 / 0.2845 / 0.5301 / -0.01 / 0.3055, 0.030.
+  none and full apply the same weights up to 8e-9 and give the same losses; their FQ differs (-12.03 / -12.99) on a
+  destroyed model in bfloat16 evaluation.
+  Finding (warm start only): half of D's update energy has an unfavourable first-order sign, spread evenly over the
+  module types. The first-order prediction fails by two orders of magnitude for every update that breaks the model
+  (it even has the wrong sign: -0.08 predicted, +11 actual) and is within a factor ~1.3-5 only for the signed
+  update. At equal Frobenius norm the signed update changes the losses far less than the uniform or random ones
+  (forget +1.5 against +4.2 to +7.3) and is the only one that leaves the model working (Utility 0.82, real-authors
+  ROUGE 0.52) while removing most of the forget memorization (EM 0.086); its forget / retain loss ratio is 1.29
+  against 1.06 (full), 1.20 (uniform) and 1.16-1.23 (random).
+- [x] 05:31 Signed shrink, phase two (10 epochs, restricted_shrink: free training of every parameter), TRAJECTORY=nll,
+  COMPONENT_DIAGNOSTICS=yes, modes none / full / signed / random / uniform_matched x seeds 0 / 1 / 2: array 25244223.
+  Result (06:15): all 15 COMPLETED; 42 parity tests passed in each, frozen tensors moved 0, component and capture
+  controls passed. Report job 25245042 (component_report.py over 25244062, 25244063, 25244223: 22 runs, shared-args
+  control passed; output `runtime_artifacts/ai-engram/recast_tofu/component_report_signed_shrink_25244223.{md,json}`).
+  After phase two, n = 3, Mem / Util / Priv / EM / FQ / Overall (real-authors ROUGE): none 0.9787 / 0.8551 / 0.9148 /
+  0.0297 / -0.44 / 0.9134 +- 0.0039 (0.235); full 0.9781 / 0.8656 / 0.9184 / 0.0277 / -0.65 / 0.9184 +- 0.0057
+  (0.253); signed 0.8467 / 0.9453 / 0.6504 / 0.1577 / -5.30 / 0.7941 +- 0.0137 (0.468); random 0.8389 / 0.9336 /
+  0.5999 / 0.1662 / -5.09 / 0.7628 +- 0.0208 (0.422); uniform_matched 0.8726 / 0.9258 / 0.6576 / 0.1470 / -4.02 /
+  0.8006 +- 0.0064 (0.409). Warm start only, random n = 3: 0.4688 / 0.1515 / 0.1781 / 0.7188 / -1.33 / 0.1926 +- 0.1676.
+  Finding: the hypothesis is not supported. Signed shrink beats uniform shrink of equal norm right after the warm
+  start (it keeps the model working and removes most forget memorization), but not after phase two: signed 0.794 +-
+  0.014 against uniform_matched 0.801 +- 0.006 (random 0.763 +- 0.021), all far below the unmodified D update (0.913 /
+  0.918). Halving the update energy lets phase two bring the forget answers back (EM 0.15-0.17 against 0.03, FQ -4 to
+  -5 against -0.4 to -0.7), whichever components are removed; the sign selection only shifts the balance towards
+  Utility (0.945) and away from Privacy. D with phase two as free training (none, 0.913) matches D with the adapter
+  (0.9155, 25222073 era).
+- [x] 06:16 First-order statistics of the original D update: job 25244997 (first_order_stats.py on run 25244062_0,
+  3:15; ||G_f|| control passed at 48 targets; output `first_order_stats_25244997.json`). c_j quantiles q05 / median /
+  q95 over 31649 components -1.05e-4 / -3.2e-7 / +9.8e-5; component cosine with G_f times sqrt(out x in), RMS: o 5.23,
+  up 5.60, down 3.62, all 4.80 (1 = a random direction). Per target, median [min, max]: ||G_f|| 0.190 [0.070, 2.070],
+  ||G_r|| 0.151 [0.041, 2.245] (both maxima at layers.1.down_proj), ||Delta W_D|| 8.95; predicted dL_f -1.5e-3
+  [-1.5e-2, +5.1e-3] (sum -0.0820, by type o / up / down -0.0151 / -0.0215 / -0.0454), predicted dL_r sum -0.0671;
+  cos(Delta W_D, G_f) median -1.0e-3, cos(Delta W_D, G_r) -1.1e-3; share of ||G_f||^2 inside the restriction median
+  0.761 (o 0.771, up 0.813, down 0.570).
+  Finding: the restriction captures three quarters of the forget gradient, yet the shrink inside it (X = -0.7 W) is
+  orthogonal to that gradient to 1e-3; single components are only ~5 times more aligned with G_f than random
+  directions and carry a random sign, so the first-order term is ~1 % of the actual loss change and the warm start
+  acts through higher-order effects.
+- [x] 06:16 Code (analysis only, new files): `replication/scripts/first_order_stats.py`. Gate: `py_compile`.
+- [x] 05:43 Decisions (user): the sign distribution of c_j for every module type; the Init Fine. and Retain rows in the
+  signed-shrink tables.
+- [x] 05:43 Code: `replication/scripts/component_signs.py` and `bash/recast_tofu/component_signs_gh200.sh` (plain and D
+  at m 1.25 on decoder_linear: per type the counts with c_j > 0 / < 0, the energy fraction with c_j < 0, overall and
+  in the top decile by sigma, the sums of c_j, the positive share of the |c_j| mass, per block the energy fraction;
+  component control as recast_tofu.py; and the gradient-definition forget / retain loss of Init Fine. and Retain).
+  New files only: 25244223 has pending tasks, recast_core / recast_tofu untouched. Gate: `py_compile`, `bash -n`.
+- [x] 05:43 Sign distribution and anchor losses: job 25244378.
+  Result (05:51, output `component_signs_25244378.json`; job finishing): component control passed at all 112
+  targets for both bases. Gradient-definition loss forget / retain: Init Fine. 0.1352 / 0.1311 (as the warm-start
+  runs), Retain 2.6582 / 0.1264 (Retain - Init: +2.523 / -0.005). Energy fraction with c_j < 0 (top decile by
+  sigma; positive share of |c_j|), plain / D at m 1.25: q_proj 0.481 (0.515; 0.354) / 0.468 (0.476; 0.376); k_proj
+  0.461 (0.475; 0.393) / 0.446 (0.468; 0.516); v_proj 0.481 (0.530; 0.512) / 0.515 (0.496; 0.524); o_proj 0.498
+  (0.534; 0.513) / 0.526 (0.561; 0.470); gate_proj 0.459 (0.473; 0.607) / 0.480 (0.485; 0.593); up_proj 0.478
+  (0.480; 0.492) / 0.499 (0.508; 0.482); down_proj 0.474 (0.419; 0.507) / 0.522 (0.494; 0.456); all 0.470 (0.466;
+  0.507) / 0.497 (0.493; 0.497). Per-block energy fraction with c_j < 0 for D: medians 0.45-0.53 for every type,
+  ranges within 0.19-0.72 except rank-1 targets (0 or 1). D's o / up / down values equal those of 25244062.
+  Finding: the first-order sign of the components is close to a fair coin for every module type and both bases,
+  also among the largest components; no type concentrates the unfavourable components (gate_proj leans slightly
+  favourable, q_proj unfavourable in |c_j| mass).
+- [x] 06:22 Decision (user): the signed-shrink table (update norm, actual and first-order loss changes, scores) with Init
+  Fine. and Retain rows, for the warm start and after phase two.
+- [x] 06:22 Code: `replication/scripts/anchor_first_order.py` (Retain as an update of Init Fine.: ||Delta|| and <G, Delta>
+  over the down_up_o targets and over all parameters with every parameter's Init Fine. mean gradient, and the
+  gradient-definition losses of both models); `recast_tofu.py --component_diagnostics yes` with phase two on native
+  weights now also measures after phase two the losses, ||theta - theta_Init|| over the targets and all parameters,
+  and <G, theta - theta_Init> (full Init Fine. gradients, kept on the CPU). No task pending when edited.
+  SHA-256 prefixes recast_tofu, anchor_first_order, first_order_stats, component_signs: 5803d490 ad454889 af92dd94
+  79c614de . Gate: `py_compile`, `bash -n`.
+- [x] 06:22 Jobs: 25245185 (anchor_first_order.py, Init Fine. and Retain); 25245195 (seed 0 of the five modes rerun with
+  the after-phase-two check; training is deterministic per seed, so its scores must equal those of 25244223 tasks
+  0-4).
+  Result 25245185: Init Fine. forget loss reproduced after the Retain model was freed (0.135153). Gradient-definition
+  loss forget / retain: Init Fine. 0.1352 / 0.1311, Retain 2.6582 / 0.1264 (change +2.5231 / -0.0047). Retain - Init
+  Fine.: ||Delta|| 1.930 over the 48 down_up_o matrices, 3.254 over all 146 parameter tensors; <G_f, Delta> +0.2408 /
+  +0.3543, <G_r, Delta> -0.0144 / -0.0199 (targets / all). For comparison the D warm start moves the same 48 matrices
+  by 57.29 with <G_f, Delta W> -0.082 and an actual forget change of +10.97.
+  Result 25245195 (06:56): all five COMPLETED (17-18 min); scores equal those of 25244223 tasks 0-4 to every printed
+  digit (none 0.9128, full 0.9227, signed 0.8021, random 0.7393, uniform_matched 0.7994): training is deterministic
+  per seed. After phase two, gradient-definition loss change forget / retain against Init Fine.; ||theta -
+  theta_Init|| over the 48 targets / all 146 tensors; <G_f, .> and <G_r, .> over targets / all: none +2.414 / -0.109;
+  57.675 / 58.471; +0.018 / +0.064, -0.126 / -0.156. full +2.379 / -0.105; 57.674 / 58.468; +0.018 / +0.064, -0.123 /
+  -0.153. signed +1.909 / -0.108; 40.568 / 41.422; +0.533 / +0.512, -0.126 / -0.254. random +1.753 / -0.108; 40.648 /
+  41.529; +0.063 / +0.109, -0.208 / -0.287. uniform_matched +1.886 / -0.110; 40.571 / 41.462; +0.053 / +0.098, -0.198
+  / -0.271. (Retain: +2.523 / -0.005; 1.930 / 3.254.)
+  Finding: phase two barely moves the weights away from the warm start (target displacement 57.29 -> 57.67), yet it
+  brings the forget loss from +11 down to +2.4 (about the Retain model's +2.5) and the retain loss below Init. The
+  half-energy updates end with a lower forget loss (+1.75 to +1.91) at the same retain loss, consistent with their
+  weaker forgetting scores.
+- [x] 07:00 Decisions (user): implement the gradient-free ways to set the shrink, the three least complex first; run
+  Experiment 2 (contraction strength t along the fixed D update and its signed version: response curve, first /
+  second-order diagnostics, signed against full, phase two at chosen t).
+  Note: with every row at the floor, W_Init + t Delta W_D is the warm start at s_min = 1 - 0.7 t (the bases do not
+  depend on s_min), so t in [0, 1] spans s_min 1 .. 0.3.
+- [x] 07:18 Code: recast_core `input_contrast` (forget / retain input-energy share ratio along a covector),
+  `direction_contrast_weights` (w_k = contrast_k / mean, clipped to s_k >= 0), `warm_start(direction_weighting=
+  "contrast")` (update U U^T X Vh^T diag(w) Vh), component selection `contrast` (keep components whose input
+  covector has contrast > 1), `scale_update`; recast_tofu `--warm_start_scale t` and `--warm_start_scale_target
+  holdout` (bisection on t with forward passes so that the forget loss equals the Init Fine. holdout loss; control:
+  each target moved by t times its warm-start update; restriction baselines follow), `--direction_weighting contrast`,
+  `--component_selection contrast`; collector shows the new fields; launcher axis WARM_STARTS (none, scale/<t>,
+  scale/holdout, dirw/contrast). Gradient-free options chosen as the three least complex: (1) holdout-calibrated
+  strength, (2) per-direction contrast weighting, (3) component selection by input contrast. Experiment 2:
+  `replication/scripts/contraction_response.py` + `bash/recast_tofu/contraction_response_gh200.sh` (t grid 0 ..
+  1 with losses, KL to Init on forget and retain_perturbed, TOFU scores, displacement; finite differences at
+  h = 1e-3 .. 3e-2; Delta^T H Delta by double backward with math attention; controls: t = 0, linear displacement,
+  first-order consistency, t = 1 against the runs' warm start, order independence logged). Three tests added.
+  SHA-256 prefixes recast_core, recast_tofu, collect_recast_tofu, contraction_response, tests: 5cfa347b 7c8844e9 d678a0ae 0256b731 9de9bb01 . Gate:
+  `py_compile`, `bash -n`.
+- [ ] 07:19 Jobs: tests 25246270; Experiment 2 response 25246271 (full) and 25246272 (signed); warm start only (EPOCHS=0),
+  restricted_shrink, D m 1.25, seed 0: 25246273 (scale/holdout, diagnostics), 25246274 (dirw/contrast), 25246275
+  (component selection contrast, diagnostics).
+  Result tests (07:21): 45 passed. Result warm starts (07:36): all three COMPLETED (13:48, 16:09, 12:38); 45 parity tests
+  passed in each; capture controls passed; component controls passed (25246273, 25246275); scale control passed.
+  scale/holdout: Init Fine. holdout loss 2.2749; t = 0.46733 after 17 forward evaluations (uniform floor equivalent
+  s = 0.6729), forget loss 2.2751, displacement 26.772 of 57.287; Mem / Util / Priv / EM / FQ / Overall 0.8692 /
+  0.6332 / 0.3775 / 0.0355 / -5.19 / 0.5578. dirw/contrast: weights per target within [0.68, 1.43] (0.6 % at the cap),
+  displacement 57.64; 0 / 0 / 0 / 1 / -13.74 / 0. contrast selection: 31294 of 31649 components kept (energy 0.9929,
+  norm 57.08); forget / retain loss +11.197 / +10.637; 0 / 0.0009 / 0 / 1 / -14.24 / 0.
+  Finding: on the D basis the two activation-contrast options barely differ from D itself (D's input directions are
+  chosen for forget / retain contrast, so nearly every component has contrast > 1 and the per-direction weights stay
+  near 1); the holdout-calibrated strength halves the displacement and leaves a partly working model with low EM.
+- [x] 07:42 Phase two (10 epochs, restricted_shrink), TRAJECTORY=nll, seeds 0 / 1 / 2: 25246612 (scale/holdout, diagnostics),
+  25246613 (dirw/contrast), 25246614 (contrast selection, diagnostics).
+  Result (08:22): all nine COMPLETED; 45 parity tests passed, frozen tensors moved 0. Mem / Util / Priv / EM / FQ /
+  Overall, seeds 0 / 1 / 2: scale/holdout (t = 0.467) 0.7285 / 0.9342 / 0.3835 / 0.2516 / -8.96 / 0.5940, 0.7638 /
+  0.9630 / 0.4412 / 0.2606 / -7.04 / 0.6501, 0.7159 / 0.9642 / 0.4596 / 0.2611 / -8.96 / 0.6508 (after phase two:
+  forget loss +1.43 / +1.51 / +1.53, retain -0.11, displacement 27.64); dirw/contrast 0.9785 / 0.8266 / 0.9559 /
+  0.0176 / -0.01 / 0.9152, 0.9949 / 0.8622 / 0.9440 / 0.0032 / -0.24 / 0.9304, 0.9939 / 0.8198 / 0.9406 / 0.0059 /
+  -0.38 / 0.9121; contrast selection 0.9664 / 0.8377 / 0.9057 / 0.0353 / -0.19 / 0.9002, 0.9832 / 0.8493 / 0.9252 /
+  0.0192 / -0.49 / 0.9159, 0.9831 / 0.8147 / 0.9144 / 0.0208 / -0.44 / 0.8987 (forget loss +2.36 to +2.40,
+  displacement 57.47). Means with the collector after Experiment 2 D.
+- [x] 08:00 Experiment 2 D (phase two at chosen strengths of the full D update, restricted_shrink, 10 epochs, TRAJECTORY=nll,
+  COMPONENT_DIAGNOSTICS=yes): t = 0.2 (weak: warm-start Utility 0.98), 0.35 (intermediate), 0.7 (strong: warm-start
+  Utility 0.05), seeds 0 / 1 / 2: array 25246964. t = 0.467 is the holdout-calibrated run (25246612) and t = 1 the
+  baseline (25244223 none).
+  Result (08:48): all nine COMPLETED; 45 parity tests passed, frozen tensors moved 0, scale control passed
+  (displacement 11.457 / 20.050 / 40.101). Mem / Util / Priv / EM / FQ / Overall, seeds 0 / 1 / 2: t = 0.2 0.5981 /
+  0.9703 / 0.2339 / 0.3949 / -11.11 / 0.4299, 0.6398 / 0.9699 / 0.2166 / 0.3793 / -9.58 / 0.4160, 0.6176 / 0.9672 /
+  0.2185 / 0.3880 / -10.66 / 0.4150; t = 0.35 0.6812 / 0.9682 / 0.2731 / 0.3250 / -9.16 / 0.4869, 0.6729 / 0.9603 /
+  0.2975 / 0.3326 / -10.00 / 0.5095, 0.7204 / 0.9587 / 0.3252 / 0.3025 / -7.04 / 0.5448; t = 0.7 0.8729 / 0.9443 /
+  0.6409 / 0.1465 / -4.02 / 0.7968, 0.8922 / 0.9253 / 0.6687 / 0.1445 / -3.62 / 0.8115, 0.8988 / 0.9164 / 0.6538 /
+  0.1416 / -2.75 / 0.8036. Forget / retain loss change after phase two: t = 0.2 +1.05 to +1.10 / -0.11; 0.35 +1.21 to
+  +1.30; 0.7 +1.87 to +1.90; (0.467: +1.43 to +1.53; 1.0: +2.38 to +2.41; Retain model +2.52).
+  Finding: the final Overall rises monotonically with the contraction strength over t = 0.2 .. 1 (about 0.42, 0.51,
+  0.63, 0.80, 0.91); no intermediate optimum. After phase two the retain loss is the same at every t (-0.11) while
+  the forget loss grows with t towards the Retain model's level; weak, functional warm starts let phase two restore
+  the forget answers (EM 0.30-0.39 at t <= 0.35).
+- [x] 08:58 Deviation: the Experiment 2 response jobs 25246271 / 25246272 will stop after their last measurement. The
+  control comparing g^T Delta of the Hessian-vector pass with the stored one used a 0.1 % tolerance, but the HVP pass
+  ran with batch 4 and the stored gradients with batch 8; the loss (example-weighted mean of batch-mean losses)
+  depends on the batching, and the signed run shows a 0.95 % gap (0.63845 vs 0.64460). Every measurement is printed
+  before that control, so the jobs were left to finish. Code: the control is now logged, not fatal; the launcher
+  uses --hvp_batch_size 8 (equal to the gradient batch); the script saves partial JSON after the curve and after the
+  finite differences; `replication/scripts/contraction_from_log.py` rebuilds the JSON of a run from its log (printed
+  precision). Gate: `py_compile`, `bash -n`.
+- [x] 08:50 Experiment 2 A-C results. Jobs 25246271 (full, 1:30:42) and 25246272 (signed, 1:05:38) both FAILED at the end at
+  the HVP first-order control described at 08:58 (deviation), after every measurement; JSON rebuilt from their logs by
+  job 25247778 (contraction_from_log.py; `runtime_artifacts/ai-engram/recast_tofu/contraction_response_{full_25246271,
+  signed_25246272}.json`). Controls passed: g^T Delta equals the per-target terms (full -0.08199, signed +0.64460); every
+  grid point moved by |t| ||Delta W||; t = 0 restored the Init weights and losses; t = 1 reproduced the runs' warm
+  start (forget loss 11.1023 / 1.6270); t = 0.7 evaluated again gave equal losses (order independence). ||Delta W||
+  full 57.287 (o 13.40, up 37.91, down 40.80), signed 40.017. Forget loss change actual / first order (full): t =
+  0.01 -0.0006 / -0.0008; 0.025 -0.0009 / -0.0021; 0.1 +0.0146 / -0.0082; 0.2 +0.126 / -0.016; 0.5 +2.644 / -0.041;
+  0.7 +6.879 / -0.057; 0.85 +9.492 / -0.070; 1.0 +10.967 / -0.082. Signed: 0.01 +0.0067 / +0.0065; 0.025 +0.0175 /
+  +0.0161; 0.05 +0.037 / +0.032; 0.2 +0.185 / +0.129; 0.5 +0.582 / +0.322; 0.7 +0.910 / +0.451; 0.85 +1.186 / +0.548;
+  1.0 +1.492 / +0.645. Directional derivatives at t = 0 (finite differences h = 1e-3 / 3e-3 / 1e-2 / 3e-2; HVP batch 4):
+  full forget phi' -0.08197 / -0.08197 / -0.08175 / -0.07980, phi'' 3.639 / 3.659 / 3.659 / 3.682, HVP 3.614; retain
+  phi'' 3.432 / 3.422 / 3.422 / 3.442, HVP 3.377; signed forget phi' +0.64462 / +0.64453 / +0.64366 / +0.63613, phi''
+  4.849 / 4.818 / 4.811 / 4.835, HVP 4.762; retain phi'' 4.668 / 4.681 / 4.690 / 4.748, HVP 4.634. Warm-start scores
+  Mem / Util / Priv / EM / FQ / Overall at t (full): 0.2 0.013 / 0.983 / 0.009 / 0.897 / -19.85 / 0.016; 0.35 0.468 /
+  0.899 / 0.086 / 0.439 / -14.50 / 0.202; 0.5 0.880 / 0.513 / 0.441 / 0.187 / -2.64 / 0.560; 0.7 0 / 0.046 / 0.017 / 1
+  / -2.75 / 0; signed 0.35 0.369 / 0.965 / 0.021 / 0.740 / -17.49 / 0.059; 0.5 0.542 / 0.939 / 0.034 / 0.585 / -13.48 /
+  0.093; 0.85 0.834 / 0.862 / 0.088 / 0.218 / -5.67 / 0.218; 1.0 0.841 / 0.823 / 0.115 / 0.086 / -4.16 / 0.271. KL(Init ||
+  W(t)) on retain_perturbed, full / signed: t = 0.2 0.102 / 0.072; 0.5 2.03 / 0.34; 1.0 10.19 / 1.11.
+  Finding: the first-order term is accurate only for t <= 0.025 (full) and t <= 0.05 (signed); the curvature at Init
+  is positive and stable over a 30x range of steps (FD and HVP agree to 1-2 %), so the second-order term explains
+  the loss rise up to t ~ 0.1 but not beyond (full at t = 1: second order -0.082 + 3.614 / 2 = +1.72 against +10.97
+  actual; signed: +3.03 predicted against +1.49 actual, an overshoot). Along the full D direction the loss explodes
+  between t = 0.2 and 0.7 (super-quadratic), along the signed one it grows sub-quadratically and the model stays
+  usable to t = 1.
+- [x] 08:50 Collector (job 25247778, `summary_20261027_0850.json`), restricted_shrink D m 1.25, phase two 10 epochs, n = 3,
+  Mem / Util / Priv / EM / FQ / Overall: t = 0.2 0.619 / 0.969 / 0.223 / 0.387 / -10.45 / 0.4203 +- 0.0084; t = 0.35
+  0.691 / 0.962 / 0.299 / 0.320 / -8.74 / 0.5137 +- 0.0292; t = 0.467 (holdout) 0.736 / 0.954 / 0.428 / 0.258 /
+  -8.32 / 0.6316 +- 0.0326; t = 0.7 0.888 / 0.929 / 0.654 / 0.144 / -3.46 / 0.8039 +- 0.0073; t = 1 (none) 0.979 /
+  0.855 / 0.915 / 0.030 / -0.44 / 0.9134 +- 0.0039; dirw/contrast 0.989 / 0.836 / 0.947 / 0.009 / -0.21 / 0.9193 +-
+  0.0098; contrast selection 0.978 / 0.834 / 0.915 / 0.025 / -0.37 / 0.9049 +- 0.0095.
+- [x] 09:05 Experiment 2 conclusions (from the entries above).
+  Finding: (1) along the full D direction the first-order term is right only for t <= 0.025; the positive curvature
+  at Init (FD and HVP agree) explains the rise up to t ~ 0.1; between t = 0.2 and 0.7 the loss grows far faster than
+  quadratically (super-quadratic breakdown) and the warm-started model stops working (Utility 0.98 -> 0.05). Along the
+  signed direction the growth is sub-quadratic and the model keeps working at every t. (2) On the warm start alone
+  full D has an interior optimum at t = 0.5 (Overall 0.560), signed D rises to 0.271 at t = 1. (3) After phase two the
+  preferred strength moves to the largest one tested: Overall 0.42 / 0.51 / 0.63 / 0.80 / 0.91 at t = 0.2 / 0.35 /
+  0.467 / 0.7 / 1; phase two restores the forget answers after every functional warm start, and only the contraction
+  that breaks the model leaves the forget loss near the Retain model after training. No transition with an interior
+  optimum appears in [0.2, 1]. (4) Gradient-free options: the holdout-calibrated strength (t = 0.467) inherits the
+  weak-contraction failure (0.632 +- 0.033); on the D basis the activation-contrast options change the update
+  little (contrast weights 0.919 +- 0.010, contrast selection 0.905 +- 0.010, against D 0.913 +- 0.004).
+  Recommendation for the next experiment (from these results only): extend t beyond 1 (s_min 0.2 / 0.1 / 0 = t 1.14 /
+  1.29 / 1.43) to find where the phase-two optimum turns; and run the signed direction scaled to the full-D
+  displacement (t = 1.43 on signed: norm 57.3) to separate direction from displacement after phase two.
+- [x] 09:05 Report page `exp2_report/index.html` (scratchpad; d3 charts of the five required figures, the phase-two table
+  and the derivative table, data inserted by `exp2_report/build.py` from the result files). Not published: the
+  Artifact tool takes local files only and the repository and scratchpad are on network storage; an empty
+  Dashboard-type artifact created first (https://claude.ai/artifact/Y8Vr2aY7hhkgnyadawx4L8) stayed empty because its
+  reference file could not be read either.
+- [x] 09:22 Decision (user): run the recommended follow-ups of Experiment 2.
+- [x] 09:23 Jobs, restricted_shrink, D rho 30 gradient side, down_up_o, s_min 0.3, EVR 0.97, m 1.25, COMPONENT_DIAGNOSTICS=yes,
+  phase two 10 epochs with TRAJECTORY=nll: 25248747 (full D at t = 1.142857 / 1.285714 / 1.428571, i.e. floor s = 0.2 /
+  0.1 / 0.0, seeds 0 / 1 / 2) and 25248748 (signed D at t = 1.428571, displacement 1.428571 x 40.017 = 57.17 against
+  full D's 57.29 at t = 1, seeds 0 / 1 / 2); warm start only (EPOCHS=0, seed 0): 25248749 (the three full-D strengths)
+  and 25248750 (signed at t = 1.428571).
+  Result (09:46): all 16 COMPLETED; 45 parity tests passed in each, frozen tensors moved 0, component, scale and capture
+  controls passed (displacements 65.47 / 73.65 / 81.84 for full D, 57.17 for signed). Collector job 25249115
+  (`summary_20261027_0946.json`), n = 3, Mem / Util / Priv / EM / FQ / Overall: full D t = 1.142857 0.982 / 0.817 /
+  0.907 / 0.017 / -0.06 / 0.8966 +- 0.0052; t = 1.285714 0.973 / 0.734 / 0.852 / 0.054 / -0.03 / 0.8419 +- 0.0058; t =
+  1.428571 0.941 / 0.653 / 0.739 / 0.095 / -0.28 / 0.7591 +- 0.0113 (t = 1: 0.979 / 0.855 / 0.915 / 0.030 / -0.44 /
+  0.9134 +- 0.0039); signed D at t = 1.428571 0.971 / 0.871 / 0.873 / 0.056 / -1.32 / 0.9028 +- 0.0041 (signed at t =
+  1, displacement 40.02: 0.847 / 0.945 / 0.650 / 0.158 / -5.30 / 0.7941 +- 0.0137). Warm start only, seed 0: full D at
+  the three strengths Overall 0 (FQ -12.03 / -14.50 / -15.29); signed at t = 1.428571 0.5640 / 0.5534 / 0.1882 / 0.3229
+  / -4.74 / 0.3373.
+  Finding: after phase two the strength optimum of full D is at t ~ 1 (s_min 0.3): Overall 0.42 / 0.51 / 0.63 / 0.80 /
+  0.91 / 0.90 / 0.84 / 0.76 over t = 0.2 .. 1.43; beyond t = 1 forgetting stays high (Mem 0.94-0.98, FQ near 0) and
+  Utility falls (0.82 -> 0.65). Scaled to the full-D displacement, the signed direction scores 0.903 +- 0.004
+  against 0.913 +- 0.004 (and against 0.794 at its own norm): most of Experiment 1's gap was the smaller
+  displacement, not the direction. At equal displacement signed keeps more Utility (0.871 vs 0.855) and a working
+  warm-start model (Utility 0.55 vs 0), with lower Privacy (0.873 vs 0.915) and FQ (-1.32 vs -0.44).
+- [x] 16:05 Decision (user): commit the work since 193c6f1; write the results report for the spec-writing LLM; one report
+  page with the charts of Experiments 1 and 2 (publishing through a local /tmp copy allowed); delete the empty
+  Dashboard artifact; run the three most promising experiments (down_proj only under restricted_shrink near the
+  strength optimum; a weaker strength for up_proj and o_proj than for down_proj; seeds 3 and 4 for the close
+  comparisons); add Engram (alpha = 0.6) and Engram (alpha_W-Norm) to the warm-start and phase-two tables and run phase
+  two from both Engram edits (does the forget set come back?); the c_j sign distribution by module type for Retain.
+- [x] 16:05 Answer (trainer_state.json of the hub checkpoints): Init Fine. was trained 5 epochs on the 4000 items of full
+  (625 steps, effective batch 32), Retain 5 epochs on retain90 (560 steps, 4.98 epochs); both warm up linearly to
+  1e-5 over epoch 1 and decay linearly to 0 (training loss 2.66 -> 0.20 and 2.66 -> 0.18). Phase two (10 epochs,
+  1130 steps, constant 1e-5 after epoch 1) is twice the length of the whole Retain training.
+- [x] 16:18 Environment: $HOME at 88.8 % (the hook blocks writes at 88 %); 1.7 GB of it are deleted VSIX files that the
+  running VS Code server (pid 541745, since 2026-10-22) keeps open, freed only when it restarts. Moved the four older
+  VS Code CLI builds and the logs of earlier server sessions to `archive/plgkrzepk/vscode-server-old-20261027`
+  (moved, nothing deleted): 87.1 %.
+- [x] 16:20 Code: `recast_core.parse_type_scales` (+ test); `recast_tofu.py --warm_start_scale_by_type` (the scale t per
+  projection type; with every row at the floor it is the per-type floor s = 1 - (1 - s_min) t), `--save_model_dir`
+  (the model after phase two, train dtype) and a positive control that `unrestricted` with s_min = 1 leaves every
+  target unchanged, which makes that configuration phase two alone from `--base_id`; launcher: `BASE_ID` / `BASE_TAG`,
+  warm start `types/<projection>=<t>,...`, `SAVE_MODEL_SEED`; collector: base_id and warm_start_scale_by_type shown,
+  save_model_dir bookkeeping. New `engram_edit.py` (+ `engram_edit_gh200.sh`): the two Engram edits of Table 3 computed
+  as table3_tofu.py does and saved as checkpoints; controls: the reloaded checkpoint equals the edit tensor by
+  tensor with lm_head tied, and it is re-scored next to the Table 3 run. `anchor_first_order.py` takes several models
+  (`--model_ids`, + `anchor_first_order_gh200.sh`). `component_signs.py --update_models`: the displacement W_model -
+  W_Init of each listed model decomposed like the ReCAST updates, by its own SVD (`<name>:full`) and projected on the D
+  basis (`<name>:D`, with the share of ||Delta||^2 the projection keeps).
+- [x] 17:01 Job 25259859 (CPU tests + a parse-only check of the new arguments, scratchpad script): 46 parity tests passed;
+  the per-type scale is accepted with every type of down_up_o and rejected when a type is missing, a value exceeds
+  1 / (1 - s_min) or another scale argument is given; unrestricted s_min 1 parses with --save_model_dir.

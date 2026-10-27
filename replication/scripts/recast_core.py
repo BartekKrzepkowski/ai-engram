@@ -19,6 +19,7 @@ scripts; none of this touches the engram package.
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
@@ -408,6 +409,152 @@ def prefix_for_forget_output(full: Basis, source: torch.Tensor, weight: torch.Te
     return best
 
 
+# ---------------- components of a projected update (extension: signed shrink) ----------------
+
+COMPONENT_SELECTIONS = ("full", "signed", "random", "uniform_matched", "contrast")
+
+
+@dataclass
+class UpdateComponents:
+    """``P(X) = U B Vh`` with the core ``B = U^T X Vh^T = P diag(sigma) Q^T`` (thin SVD): the update is the sum of the
+    Frobenius-orthogonal components ``D_j = sigma_j (U p_j)(Vh^T q_j)^T``, with first-order forget contributions
+    ``c_j = <G_f, D_j>_F = sigma_j p_j^T (U^T G_f Vh^T) q_j``. float64; ``U = I`` when the output side is free."""
+    left: torch.Tensor          # U P, (out, k)
+    sigma: torch.Tensor         # (k,)
+    right: torch.Tensor         # Q^T Vh, (k, in)
+    contribution: torch.Tensor  # c_j, (k,)
+
+
+def decompose_update(proposal: torch.Tensor, u: Optional[torch.Tensor], vh: torch.Tensor,
+                     grad: torch.Tensor) -> UpdateComponents:
+    """Components of ``project(proposal, u, vh)``; the SVD runs on the small core, not the full matrix."""
+    x = proposal.reshape(proposal.shape[0], -1).double()
+    g = grad.reshape(grad.shape[0], -1).double()
+    v = vh.double()
+    if u is None:
+        core, k = x @ v.transpose(0, 1), g @ v.transpose(0, 1)
+    else:
+        ud = u.double()
+        core, k = ud.transpose(0, 1) @ x @ v.transpose(0, 1), ud.transpose(0, 1) @ g @ v.transpose(0, 1)
+    p, sigma, qh = torch.linalg.svd(core, full_matrices=False)
+    contribution = sigma * ((p.transpose(0, 1) @ k) * qh).sum(1)
+    return UpdateComponents(p if u is None else ud @ p, sigma, qh @ v, contribution)
+
+
+def compose_update(c: UpdateComponents, alpha: torch.Tensor) -> torch.Tensor:
+    """``sum_j alpha_j D_j`` (float64)."""
+    return (c.left * (alpha * c.sigma)) @ c.right
+
+
+def input_contrast(rows: torch.Tensor, cov_forget: torch.Tensor, cov_retain: torch.Tensor) -> torch.Tensor:
+    """Per input covector b (a row): the forget / retain share of input energy along it,
+    (b C_f b^T / tr C_f) / (b C_r b^T / tr C_r), computed without any gradient (fp64)."""
+    r = rows.double()
+    cf, cr = cov_forget.to(r.device).double(), cov_retain.to(r.device).double()
+    num = ((r @ cf) * r).sum(1) / float(torch.trace(cf))
+    den = ((r @ cr) * r).sum(1) / float(torch.trace(cr))
+    return num / den.clamp_min(1e-300)
+
+
+def direction_contrast_weights(vh: torch.Tensor, cov_forget: torch.Tensor, cov_retain: torch.Tensor,
+                               s_min: float) -> torch.Tensor:
+    """Gradient-free per-direction shrink weights (extension): w_k = contrast_k / mean(contrast) for the input
+    covectors of ``vh``, clipped to [0, 1 / (1 - s_min)] so that every direction keeps a shrink factor
+    s_k = 1 - (1 - s_min) w_k in [0, 1]; the mean weight is 1 before clipping (the same average shrink as the
+    uniform update, moved towards the directions forget uses more than retain)."""
+    contrast = input_contrast(vh, cov_forget, cov_retain)
+    w = contrast / contrast.mean()
+    cap = 1.0 / (1.0 - float(s_min)) if s_min < 1 else 1.0
+    return w.clamp(0.0, cap)
+
+
+def component_weights(c: UpdateComponents, selection: str, generator: Optional[torch.Generator] = None,
+                      eps: float = ENERGY_EPS, contrast: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """alpha per component: ``full`` 1; ``signed`` 1 where c_j > 0, else 0; ``random`` as many ones as ``signed`` at
+    positions drawn by ``generator``; ``uniform_matched`` the constant gamma = ||signed update|| / ||full update||
+    (0 for a zero update), i.e. the full update scaled to the Frobenius norm of the signed one; ``contrast``
+    (gradient-free) 1 where the component's input covector carries a larger share of forget than of retain input
+    energy (``contrast`` > 1, from ``input_contrast``), else 0."""
+    n = c.sigma.numel()
+    ones = torch.ones(n, dtype=c.sigma.dtype, device=c.sigma.device)
+    positive = (c.contribution > 0).to(c.sigma.dtype)
+    if selection == "full":
+        return ones
+    if selection == "signed":
+        return positive
+    if selection == "contrast":
+        if contrast is None:
+            raise ValueError("the contrast selection needs the input contrast of every component")
+        return (contrast > 1.0).to(c.sigma.dtype)
+    if selection == "random":
+        alpha = torch.zeros(n, dtype=c.sigma.dtype)
+        alpha[torch.randperm(n, generator=generator)[:int(positive.sum())]] = 1.0
+        return alpha.to(c.sigma.device)
+    if selection == "uniform_matched":
+        energy = c.sigma.square()
+        total = float(energy.sum())
+        return ones * ((float((positive * energy).sum()) / total) ** 0.5 if total > eps else 0.0)
+    raise ValueError(f"component selection must be one of {COMPONENT_SELECTIONS}, got {selection!r}")
+
+
+def effective_rank(values: torch.Tensor) -> float:
+    """Roy-Vetterli effective rank exp(H(p)), p = values / sum(values), for non-negative singular values."""
+    total = float(values.sum())
+    if total <= 0:
+        return 0.0
+    p = values[values > 0] / total
+    return float(torch.exp(-(p * p.log()).sum()))
+
+
+def scale_update(original: torch.Tensor, baseline: torch.Tensor, t: float) -> torch.Tensor:
+    """``W(t) = W_Init + t (W* - W_Init)`` from the Init weights, never from an already modified one (fp32)."""
+    w0 = original.float()
+    return w0 + float(t) * (baseline.float().to(w0.device) - w0)
+
+
+def parse_type_scales(spec: str) -> Dict[str, float]:
+    """``down_proj=1,up_proj=0.714`` -> {projection: t}, the per-type warm-start scale (extension)."""
+    out: Dict[str, float] = {}
+    for item in spec.split(","):
+        key, sep, value = item.partition("=")
+        key = key.strip()
+        if not sep or not key or key in out:
+            raise ValueError(f"expected projection=t pairs without repeats, got {spec!r}")
+        out[key] = float(value)
+    return out
+
+
+def component_report(c: UpdateComponents, alpha: torch.Tensor, original: torch.Tensor, applied: torch.Tensor,
+                     grad_forget: torch.Tensor, grad_retain: torch.Tensor, keep_arrays: bool) -> dict:
+    """Per-target diagnostics of the decomposition and of the update actually applied."""
+    energy = c.sigma.square()
+    total = float(energy.sum())
+    pos, neg = c.contribution > 0, c.contribution < 0
+    d = original.reshape(original.shape[0], -1).double()
+    full = compose_update(c, torch.ones_like(alpha))
+    rep = {
+        "components": int(c.sigma.numel()), "positive": int(pos.sum()), "negative": int(neg.sum()),
+        "kept": int((alpha > 0).sum()), "alpha_max": float(alpha.max()) if alpha.numel() else 0.0,
+        "energy": total,
+        "energy_positive_fraction": float(energy[pos].sum()) / total if total > 0 else 0.0,
+        "energy_negative_fraction": float(energy[neg].sum()) / total if total > 0 else 0.0,
+        "contribution_sum": float(c.contribution.sum()), "contribution_positive": float(c.contribution[pos].sum()),
+        "contribution_negative": float(c.contribution[neg].sum()),
+        "first_order_forget_direct": float((grad_forget.reshape_as(d).double() * d).sum()),  # <G_f, P(X)>
+        "reconstruction_rel_error": float((d - full).norm() / d.norm()) if float(d.norm()) > 0 else 0.0,
+        "reconstruction_abs_error": float((d - full).norm()), "grad_forget_norm": float(grad_forget.norm()),
+        "original_norm": float(d.norm()), "applied_norm": float(applied.norm()),
+        "applied_energy_fraction": float((alpha.square() * energy).sum()) / total if total > 0 else 0.0,
+        "effective_rank_original": effective_rank(c.sigma), "effective_rank_applied": effective_rank(alpha * c.sigma),
+        "predicted_forget_change": float((alpha * c.contribution).sum()),
+        "predicted_retain_change": float((grad_retain.reshape_as(d).double() * applied.reshape_as(d)).sum()),
+    }
+    if keep_arrays:
+        rep["sigma"] = c.sigma.tolist()
+        rep["contribution"] = c.contribution.tolist()
+    return rep
+
+
 # ---------------- warm start ----------------
 
 @dataclass
@@ -443,6 +590,10 @@ def warm_start(
     retain_covariances: Optional[Dict[str, torch.Tensor]] = None,
     representation_mix: float = 1.0,
     forget_output_target: Optional[float] = None,
+    component_selection: Optional[str] = None,
+    component_diagnostics: bool = False,
+    component_seed: int = 0,
+    direction_weighting: Optional[str] = None,
 ) -> Tuple[Dict[str, Restriction], Dict[str, dict]]:
     """Apply the ReCAST warm start in place. Restricted when ``restriction_source`` is given.
 
@@ -472,6 +623,17 @@ def warm_start(
     changes the forget outputs by ``q_f = tr(D C_f D^T) / tr(W C_f W^T) >= q*`` (``C_f`` from
     ``forget_covariances``), so the energy-weighted total ``sum tr(D C_f D^T) / sum tr(W C_f W^T)``
     reaches q* too; the report gives each target's ``forget_output_change``.
+    ``component_selection`` (extension: signed shrink) splits each active target's projected update ``P(X)``,
+    ``X = S W - W``, into the Frobenius-orthogonal components of ``decompose_update`` with the forget gradient
+    ``restriction_source`` and applies ``sum_j alpha_j D_j`` with alpha from ``component_weights`` (``random`` draws
+    from a generator seeded by ``component_seed`` and the target name); ``uniform_matched`` applies gamma P(X) itself.
+    ``component_diagnostics`` reports the decomposition (``components`` per target, with sigma and c_j) without
+    changing the update unless a selection is given; the ``contrast`` selection (gradient-free) keeps the components
+    whose input covector carries a larger share of forget than of retain input energy. ``direction_weighting
+    ="contrast"`` (gradient-free) shrinks each input direction of the basis by s_k = 1 - (1 - s) w_k with w_k from
+    ``direction_contrast_weights`` (``forget_covariances`` / ``retain_covariances``), i.e. the update
+    ``U U^T X Vh^T diag(w) Vh``. Targets are updated independently from the Init Fine. weights and gradients, each
+    exactly once.
     """
     if alignment_scope not in ("full_space", "restriction_subspace"):
         raise ValueError(f"alignment_scope must be full_space or restriction_subspace, got {alignment_scope!r}")
@@ -489,6 +651,19 @@ def warm_start(
         raise ValueError("whitening needs whitening_rho")
     if rank_multiplier is not None and (not restricted or rank_multiplier <= 0):
         raise ValueError("rank_multiplier needs a restriction and a positive value")
+    if (component_selection is not None or component_diagnostics) and (
+            not restricted or input_filters is not None
+            or (component_selection is not None and component_selection not in COMPONENT_SELECTIONS)):
+        raise ValueError(f"component selection / diagnostics need a restriction and no input filter; selections: "
+                         f"{COMPONENT_SELECTIONS}")
+    if component_selection == "contrast" and (forget_covariances is None or retain_covariances is None):
+        raise ValueError("the contrast selection needs forget_covariances and retain_covariances")
+    if direction_weighting is not None and (
+            direction_weighting != "contrast" or not restricted or input_filters is not None
+            or component_selection is not None or component_diagnostics
+            or forget_covariances is None or retain_covariances is None):
+        raise ValueError("direction_weighting='contrast' needs a restriction, both covariances, no input filter and "
+                         "no component selection or diagnostics (they decompose the unweighted update)")
     if forget_output_target is not None and (
             not restricted or not 0.0 < forget_output_target < 1.0 or rank_multiplier is not None
             or forget_covariances is None or alignment_scope != "full_space" or layer_scaling != "none"
@@ -566,6 +741,29 @@ def warm_start(
             info["reference_rank"] = reference_rank[name]
         if restricted:
             delta = project(proposal, basis.u, basis.vh) if basis.active else proposal
+            if direction_weighting is not None and basis.active:
+                vh32 = basis.vh.float()
+                w_dir = direction_contrast_weights(basis.vh, forget_covariances[name], retain_covariances[name],
+                                                   floors[name]).float().to(delta.device)
+                delta = ((delta @ vh32.transpose(0, 1)) * w_dir) @ vh32
+                cap = 1.0 / (1.0 - floors[name]) if floors[name] < 1 else 1.0
+                info["direction_weights"] = {"mean": float(w_dir.mean()), "min": float(w_dir.min()),
+                                             "max": float(w_dir.max()),
+                                             "at_cap": float((w_dir >= cap - 1e-6).float().mean())}
+            if (component_selection is not None or component_diagnostics) and basis.active:
+                parts = decompose_update(proposal, basis.u, basis.vh, restriction_source[name])
+                generator = torch.Generator().manual_seed(int(component_seed) * 1000003 + zlib.crc32(name.encode()))
+                contrast = (input_contrast(parts.right, forget_covariances[name], retain_covariances[name])
+                            if component_selection == "contrast" else None)
+                alpha = component_weights(parts, component_selection or "full", generator, contrast=contrast)
+                applied = compose_update(parts, alpha)
+                if component_selection == "uniform_matched":  # the original update itself, scaled
+                    applied = float(alpha[0]) * delta.reshape_as(applied).double() if alpha.numel() else 0.0 * applied
+                info["components"] = component_report(parts, alpha, delta, applied, restriction_source[name],
+                                                      grad_retain[name], keep_arrays=component_diagnostics)
+                if component_selection is not None:
+                    delta = applied.reshape_as(delta).to(delta.dtype)
+                del parts, applied
             if input_filters is not None and basis.active:
                 filtered = delta @ input_filters[name].to(delta.device)
                 info["retain_filter_kept"] = float(filtered.norm() / (delta.norm() + COS_EPS))

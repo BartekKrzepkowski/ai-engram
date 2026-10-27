@@ -17,6 +17,10 @@ Restricted variants can soften the warm start along the input directions retain 
 build each restriction basis from the forget gradient whitened by C_r (``--restriction_whitening
 retain_input``, ``recast_core.whitened_svd_basis``) (C). The edit budget is the EVR rank, an explicit
 rank multiple of it, or a forget-output target per target (``--restriction_forget_output_target``).
+``--component_selection`` (extension, signed shrink) keeps, removes or rescales the Frobenius-orthogonal
+components ``D_j`` of each projected update by the sign of their first-order forget contribution
+``c_j = <G_f, D_j>``, with a random and a norm-matched control; ``--component_diagnostics yes`` reports the
+decomposition and the actual against the predicted forget / retain loss change of the warm start.
 ``--epochs 0`` evaluates the warm-started model without phase two, and ``--eval_trajectory nll`` tracks
 the answer-token NLL and exact memorization of forget, retain (the 400 Model Utility items), real authors
 and world facts before phase two and after every epoch (extensions).
@@ -44,13 +48,14 @@ import platform
 import random
 import time
 
-from recast_core import (TARGET_PROFILES, SemuAdapterLinear, apply_semu_adapters, change_report,
+from recast_core import (COMPONENT_SELECTIONS, TARGET_PROFILES, SemuAdapterLinear, apply_semu_adapters, change_report,
                          collect_input_covariances, collect_mean_gradients, drift_report, free_parameters,
                          frozen_checksums, mix_sources, ridge_input_filter, svd_basis,
                          parse_blocks,
                          parse_points,
+                         parse_type_scales,
                          piecewise_linear,
-                         select_targets, snapshot_trainable, untie_output_embedding, warm_start)
+                         scale_update, select_targets, snapshot_trainable, untie_output_embedding, warm_start)
 from table3_tofu import COLUMNS, PAPER_TABLE3, Stage, git_info, to_jsonable
 from tofu_capture import TofuCapture
 
@@ -111,6 +116,31 @@ def parse_args():
                    help="restricted only (extension): per target the smallest rank of its basis family whose "
                         "warm-start delta D changes forget outputs by tr(D C_f D^T) / tr(W C_f W^T) >= this value, "
                         "C_f the forget input covariance over answer tokens; replaces --restriction_rank_multiplier")
+    p.add_argument("--component_selection", choices=list(COMPONENT_SELECTIONS),
+                   help="restricted only (extension): apply sum_j alpha_j D_j of the components D_j of each projected "
+                        "update, c_j = <G_f, D_j>: full (alpha 1, the SVD reconstruction), signed (1 if c_j > 0, else "
+                        "0), random (as many ones as signed, drawn with --seed), uniform_matched (the original update "
+                        "scaled to the signed update's Frobenius norm, per target); absent = the original update")
+    p.add_argument("--component_diagnostics", choices=["yes"],
+                   help="restricted only (extension): per-target components (sigma, c_j) to components.json, and the "
+                        "forget / retain loss before and after the warm start against <G, Delta W>; with phase two "
+                        "on native weights also after phase two: ||theta - theta_Init|| over the targets and over all "
+                        "parameters, and <G, theta - theta_Init> with every parameter's Init Fine. mean gradient")
+    p.add_argument("--warm_start_scale", type=float,
+                   help="restricted only (extension): apply W_Init + t (W* - W_Init) with this t instead of W*, every "
+                        "target from its Init weights; t in [0, 1 / (1 - s_min)] (s_min 0.3: t = 1 is W*)")
+    p.add_argument("--warm_start_scale_target", choices=["holdout"],
+                   help="restricted only (extension, gradient-free): choose t by bisection, with forward passes "
+                        "only, so that the forget loss of W_Init + t (W* - W_Init) equals the Init Fine. loss on the "
+                        "holdout split (authors the model never saw)")
+    p.add_argument("--warm_start_scale_by_type",
+                   help="restricted only (extension): --warm_start_scale per projection type, e.g. "
+                        "down_proj=1,up_proj=0.714,o_proj=0.714, every type of --targets listed; with every row at the "
+                        "floor (row alignment ~ 0) t is the per-type floor s = 1 - (1 - s_min) t")
+    p.add_argument("--direction_weighting", choices=["contrast"],
+                   help="restricted only (extension, gradient-free): shrink each input direction v_k of the basis by "
+                        "s_k = 1 - (1 - s_min) w_k, w_k = forget/retain input-energy share ratio along v_k over its "
+                        "mean (clipped so that s_k >= 0)")
     p.add_argument("--representation_mix", type=float,
                    help="basis D only: input-side forget signal (1 - beta) G_f^T G_f / tr + beta C_f / tr; "
                         "1 (default) = activations (D), 0 = gradient (the input side of C)")
@@ -145,6 +175,7 @@ def parse_args():
     p.add_argument("--eval_batch_size", type=int, required=True)
     p.add_argument("--anchors_raw", required=True, help="raw_metrics.json holding 'Init Fine.' and 'Retain'")
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--save_model_dir", help="extension: save the model after phase two (train dtype) to this directory")
     p.add_argument("--run_name", required=True)
     p.add_argument("--wandb_mode", required=True, choices=["online", "offline", "disabled"])
     p.add_argument("--wandb_project", required=True)
@@ -184,6 +215,32 @@ def parse_args():
                 "--restriction_forget_output_target, and --restriction_whitening none")
     if args.epochs < 0:
         p.error("--epochs must be non-negative (0 = no phase two)")
+    if args.warm_start_scale is not None and (args.warm_start_scale_target is not None or not restricted
+                                              or not 0.0 <= args.warm_start_scale
+                                              <= (1.0 / (1.0 - args.s_min) if args.s_min < 1.0 else 0.0)):
+        p.error("--warm_start_scale needs a restricted variant, no --warm_start_scale_target and a value in "
+                "[0, 1 / (1 - s_min)]")
+    if args.warm_start_scale_target is not None and (not restricted or args.s_min >= 1.0):
+        p.error("--warm_start_scale_target needs a restricted variant and s_min < 1")
+    if args.warm_start_scale_by_type is not None:
+        try:
+            by_type = parse_type_scales(args.warm_start_scale_by_type)
+        except ValueError as e:
+            p.error(str(e))
+        cap = 1.0 / (1.0 - args.s_min) if args.s_min < 1.0 else 0.0
+        if (not restricted or args.warm_start_scale is not None or args.warm_start_scale_target is not None
+                or set(by_type) != set(TARGET_PROFILES[args.targets][0])
+                or not all(0.0 <= t <= cap for t in by_type.values())):
+            p.error("--warm_start_scale_by_type needs a restricted variant, no other scale argument, every projection "
+                    f"type of --targets {args.targets} exactly once and values in [0, 1 / (1 - s_min)]")
+    if args.direction_weighting is not None and (not restricted or args.retain_input_filter != "none"
+                                                 or args.component_selection or args.component_diagnostics):
+        p.error("--direction_weighting needs a restricted variant, --retain_input_filter none and no component "
+                "selection or diagnostics")
+    if (args.component_selection or args.component_diagnostics) and (
+            not restricted or args.restriction_source != "forget_only" or args.retain_input_filter != "none"):
+        p.error("--component_selection / --component_diagnostics need a restricted variant, --restriction_source "
+                "forget_only (c_j uses the forget gradient) and --retain_input_filter none")
     if args.eval_trajectory and (args.epochs == 0 or args.epochs != int(args.epochs)):
         p.error("--eval_trajectory needs a positive whole number of --epochs")
     if args.representation_mix is not None and (args.restriction_representation in (None, "none")
@@ -337,12 +394,14 @@ def main():
 
     input_filters, whitening, covs, covs_forget = None, None, None, None
     representation = restricted and args.restriction_representation not in (None, "none")
-    if restricted and (args.retain_input_filter == "ridge" or args.restriction_whitening == "retain_input" or representation):
+    contrast = restricted and (args.direction_weighting == "contrast" or args.component_selection == "contrast")
+    if restricted and (args.retain_input_filter == "ridge" or args.restriction_whitening == "retain_input" or representation
+                       or contrast):
         with Stage("retain input covariance", timings):
             covs, n_tokens = collect_input_covariances(model, gradient_loader(retain), restricted_targets, feats)
         results["retain_input_covariance"] = {"answer_tokens": n_tokens}
     target = args.restriction_forget_output_target if restricted else None
-    if representation or target is not None:
+    if representation or target is not None or contrast:
         with Stage("forget input covariance", timings):
             covs_forget, n_tokens_forget = collect_input_covariances(model, gradient_loader(forget), restricted_targets, feats)
         results["forget_input_covariance"] = {"answer_tokens": n_tokens_forget}
@@ -373,6 +432,62 @@ def main():
         results["retain_filter"] = {"answer_tokens": n_tokens, "per_target": filter_report}
 
     original = {n: m.weight.detach().to("cpu", copy=True) for n, m in targets.items()}  # drift reference
+
+    @torch.no_grad()
+    def mean_loss(ds):
+        """The loss the source gradients differentiate: the example-weighted mean of each batch's mean NLL."""
+        was_training = model.training
+        model.eval()
+        total, count = 0.0, 0
+        for b in gradient_loader(ds):
+            x = feats(b)
+            size = int(x["input_ids"].shape[0])
+            total += float(model(**x).loss) * size
+            count += size
+        model.train(was_training)
+        return total / count
+
+    losses_before = None
+    if args.component_diagnostics:
+        with Stage("losses before the warm start", timings):
+            losses_before = {"forget": mean_loss(forget), "retain": mean_loss(retain)}
+    holdout_init = None
+    if args.warm_start_scale_target == "holdout":
+        with Stage("holdout loss at Init Fine.", timings):
+            holdout_init = mean_loss(D["ho"])
+        print(f"[scale] target: Init Fine. loss on the holdout split {holdout_init:.4f}")
+    full_grads, init_state = None, None
+    if args.component_diagnostics and args.epochs > 0 and args.variant != "restricted_semu":
+        def full_gradient(ds):
+            """Every parameter's mean gradient, defined as the source gradients (eval mode, example-weighted mean
+            of batch-mean losses); accumulated on the GPU, returned on the CPU."""
+            was_training = model.training
+            model.eval()
+            params = dict(model.named_parameters())
+            flags = {n: t.requires_grad for n, t in params.items()}
+            for t in params.values():
+                t.requires_grad_(True)
+            sums = {n: torch.zeros_like(t, dtype=torch.float32) for n, t in params.items()}
+            count = 0
+            for b in gradient_loader(ds):
+                x = feats(b)
+                size = int(x["input_ids"].shape[0])
+                model.zero_grad(set_to_none=True)
+                model(**x).loss.backward()
+                for n, t in params.items():
+                    if t.grad is not None:
+                        sums[n].add_(t.grad.float(), alpha=float(size))
+                count += size
+            model.zero_grad(set_to_none=True)
+            for n, t in params.items():
+                t.requires_grad_(flags[n])
+            model.train(was_training)
+            return {n: (v / count).cpu() for n, v in sums.items()}
+
+        with Stage("full gradients at Init Fine.", timings):
+            full_grads = {"forget": full_gradient(forget), "retain": full_gradient(retain)}
+        init_state = {n: t.detach().to("cpu", copy=True) for n, t in model.named_parameters()}
+        torch.cuda.empty_cache()
     source = grad_forget
     if restricted and args.restriction_source == "full_data":
         source = {n: mix_sources(grad_forget[n], grad_retain[n], n_forget, n_retain) for n in grad_forget}
@@ -384,9 +499,84 @@ def main():
             layer_scaling=args.shrink_layer_scaling, input_filters=input_filters, whitening=whitening,
             whitening_rho=args.whitening_rho, rank_multiplier=args.restriction_rank_multiplier,
             representation_output=args.restriction_representation if representation else None,
-            forget_covariances=covs_forget, retain_covariances=covs if representation else None,
+            forget_covariances=covs_forget, retain_covariances=covs if (representation or contrast) else None,
+            direction_weighting=args.direction_weighting,
             representation_mix=1.0 if args.representation_mix is None else args.representation_mix,
-            forget_output_target=target)
+            forget_output_target=target, component_selection=args.component_selection,
+            component_diagnostics=bool(args.component_diagnostics), component_seed=args.seed)
+    if args.component_selection or args.component_diagnostics:
+        comp = {n: r["components"] for n, r in ws_report.items() if "components" in r}
+        arrays = {n: {k: c.pop(k) for k in ("sigma", "contribution") if k in c} for n, c in comp.items()}
+        # Positive controls: the fp64 components rebuild the fp32 original update to within fp32 rounding of the
+        # proposal (||P(X) - sum D_j|| <= 1e-5 ||X||; the fp32 core of a near-zero update can lose most relative
+        # digits), their contributions sum to <G_f, P(X)> up to ||G_f|| times that difference (Cauchy-Schwarz), and
+        # the selection kept what it should.
+        def control_failed(n, c):
+            if c["reconstruction_abs_error"] > 1e-5 * ws_report[n]["proposal_norm"]:
+                return True
+            gap = abs(c["contribution_sum"] - c["first_order_forget_direct"])
+            return gap > c["grad_forget_norm"] * c["reconstruction_abs_error"] + 1e-6 * abs(c["first_order_forget_direct"]) + 1e-12
+
+        bad = [n for n, c in comp.items() if control_failed(n, c)]
+        if not comp or bad:
+            raise RuntimeError(f"component decomposition control failed at {bad[:3]} ({len(comp)} targets): " + "; ".join(
+                f"{n}: reconstruction {comp[n]['reconstruction_abs_error']:.3e} vs proposal "
+                f"{ws_report[n]['proposal_norm']:.3e}, sum c_j {comp[n]['contribution_sum']:.6e} vs "
+                f"{comp[n]['first_order_forget_direct']:.6e}" for n in bad[:3]))
+        worst = max(comp, key=lambda n: comp[n]["reconstruction_rel_error"])
+        if args.component_selection in ("signed", "random") and any(c["kept"] != c["positive"] for c in comp.values()):
+            raise RuntimeError("the selection kept a different number of components than have c_j > 0")
+        if args.component_selection in (None, "full", "uniform_matched") and any(
+                c["kept"] != c["components"] and not (c["kept"] == 0 and c["positive"] == 0) for c in comp.values()):
+            raise RuntimeError("a full or uniform update dropped components")  # gamma = 0 only without c_j > 0
+
+        def summed(rows):
+            keys = ("components", "positive", "negative", "kept", "energy", "contribution_sum", "contribution_positive",
+                    "contribution_negative", "predicted_forget_change", "predicted_retain_change")
+            out = {k: sum(r[k] for r in rows) for k in keys}
+            energy = sum(r["energy"] for r in rows)
+            for k in ("energy_positive_fraction", "energy_negative_fraction", "applied_energy_fraction"):
+                out[k] = sum(r[k] * r["energy"] for r in rows) / energy if energy > 0 else 0.0
+            out["original_norm"] = sum(r["original_norm"] ** 2 for r in rows) ** 0.5
+            out["applied_norm"] = sum(r["applied_norm"] ** 2 for r in rows) ** 0.5
+            out["effective_rank_original_mean"] = sum(r["effective_rank_original"] for r in rows) / len(rows)
+            out["effective_rank_applied_mean"] = sum(r["effective_rank_applied"] for r in rows) / len(rows)
+            out["max_reconstruction_rel_error"] = max(r["reconstruction_rel_error"] for r in rows)
+            out["targets"] = len(rows)
+            return out
+
+        comp_summary = {p_: summed([c for n, c in comp.items() if n.endswith(p_)]) for p_ in PROJECTIONS
+                        if any(n.endswith(p_) for n in comp)}
+        comp_summary["all"] = summed(list(comp.values()))
+        for p_, c in comp_summary.items():
+            print(f"[components] {p_:9s} selection={args.component_selection or 'none'}: components {c['components']} "
+                  f"c_j>0 {c['positive']} kept {c['kept']}; energy with c_j>0 {c['energy_positive_fraction']:.4f}, "
+                  f"c_j<0 {c['energy_negative_fraction']:.4f}; applied energy {c['applied_energy_fraction']:.4f}, "
+                  f"norm {c['applied_norm']:.4e} / {c['original_norm']:.4e}; effective rank "
+                  f"{c['effective_rank_applied_mean']:.1f} / {c['effective_rank_original_mean']:.1f}; sum c_j "
+                  f"{c['contribution_sum']:.4e} (+{c['contribution_positive']:.4e} {c['contribution_negative']:.4e}); "
+                  f"predicted dL_f {c['predicted_forget_change']:.4e} dL_r {c['predicted_retain_change']:.4e}")
+        print(f"[control] components: rebuild the original update (max rel. error "
+              f"{comp_summary['all']['max_reconstruction_rel_error']:.2e} at {worst}, abs "
+              f"{comp[worst]['reconstruction_abs_error']:.2e}, update norm {comp[worst]['original_norm']:.2e}), "
+              f"sum c_j = <G_f, P(X)>, selection counts")
+        results["components"] = {"selection": args.component_selection, "per_projection": comp_summary}
+        if args.component_diagnostics:
+            with open(os.path.join(args.out_dir, "components.json"), "w") as f:
+                json.dump(to_jsonable({n: {**comp[n], **arrays[n]} for n in comp}), f)
+            with Stage("losses after the warm start", timings):
+                losses_after = {"forget": mean_loss(forget), "retain": mean_loss(retain)}
+            check = {}
+            for side, key in (("forget", "predicted_forget_change"), ("retain", "predicted_retain_change")):
+                actual = losses_after[side] - losses_before[side]
+                predicted = comp_summary["all"][key]
+                check[side] = {"before": losses_before[side], "after": losses_after[side], "actual_change": actual,
+                               "predicted_change": predicted, "abs_error": abs(actual - predicted),
+                               "rel_error": abs(actual - predicted) / abs(predicted) if abs(predicted) > 1e-8 else None}
+                print(f"[first-order] {side}: loss {losses_before[side]:.4f} -> {losses_after[side]:.4f}, actual change "
+                      f"{actual:.4e}, predicted <G, Delta W> {predicted:.4e}, abs error {check[side]['abs_error']:.4e}, "
+                      f"rel error {'-' if check[side]['rel_error'] is None else format(check[side]['rel_error'], '.3g')}")
+            results["components"]["first_order_check"] = check
     if target is not None:
         # Positive control: every active target reaches the forget-output target, or uses its whole family.
         reached = {n: r for n, r in ws_report.items() if "forget_output_change" in r}
@@ -449,6 +639,73 @@ def main():
                   f"{sum(e['rank_plain'] for e in es) / len(es):.0f}"
                   for p in PROJECTIONS for es in [[e for k, e in energy.items() if k.endswith(p)]] if es))
         results["whitening"] = {"rho": args.whitening_rho, "per_target": energy}
+    by_type = parse_type_scales(args.warm_start_scale_by_type) if args.warm_start_scale_by_type else None
+    if args.warm_start_scale is not None or args.warm_start_scale_target is not None or by_type:
+        # W(t) = W_Init + t (W* - W_Init), each target rebuilt from its Init weights for every t
+        starred = {n: m.weight.detach().clone() for n, m in targets.items()}
+        init_w = {n: original[n].to(device) for n in targets}
+
+        def t_of(n, t):  # the target's own t under --warm_start_scale_by_type
+            return by_type[n.rsplit(".", 1)[-1]] if by_type else t
+
+        def set_scale(t):
+            with torch.no_grad():
+                for n, m in targets.items():
+                    m.weight.copy_(scale_update(init_w[n], starred[n], t_of(n, t)).to(m.weight.dtype))
+
+        search = []
+        scale = args.warm_start_scale
+        if args.warm_start_scale_target == "holdout":
+            with Stage("scale search", timings):
+                lo, hi = 0.0, 1.0 / (1.0 - args.s_min)
+                set_scale(hi)
+                f_hi = mean_loss(forget)
+                search.append((hi, f_hi))
+                if f_hi <= holdout_init:
+                    scale = hi  # even s = 0 does not reach the target
+                else:
+                    for _ in range(16):  # forget loss grows with t; bracket [lo, hi] to ~2e-5 in t
+                        mid = (lo + hi) / 2
+                        set_scale(mid)
+                        f_mid = mean_loss(forget)
+                        search.append((mid, f_mid))
+                        lo, hi = (mid, hi) if f_mid < holdout_init else (lo, mid)
+                    scale = hi
+        set_scale(scale)
+        # Positive control: every target moved by exactly t times its warm-start update.
+        moved = {n: float((m.weight.detach().float() - init_w[n].float()).norm()) for n, m in targets.items()}
+        full = {n: float((starred[n].float() - init_w[n].float()).norm()) for n in targets}
+        bad = [n for n in targets if abs(moved[n] - t_of(n, scale) * full[n]) > 1e-4 * max(full[n], 1e-12) + 1e-6]
+        if bad:
+            raise RuntimeError(f"scaled update is not t times the warm start at {bad[:3]}")
+        for n in restrictions:
+            restrictions[n] = type(restrictions[n])(baseline=targets[n].weight.detach().clone(),
+                                                    basis=restrictions[n].basis)
+        scale_report = {"t": scale, "displacement": sum(v * v for v in moved.values()) ** 0.5,
+                        "displacement_t1": sum(v * v for v in full.values()) ** 0.5, "search": search}
+        if by_type:
+            scale_report.update({"t_by_type": by_type, "s_equivalent_by_type": {
+                k: 1.0 - (1.0 - args.s_min) * v for k, v in by_type.items()}, "displacement_by_type": {
+                k: sum(v * v for n, v in moved.items() if n.endswith(k)) ** 0.5 for k in by_type}})
+        else:
+            scale_report["s_equivalent"] = 1.0 - (1.0 - args.s_min) * scale
+        if holdout_init is not None:
+            scale_report.update({"target_holdout_loss": holdout_init, "forget_loss": mean_loss(forget)})
+        print((f"[scale] t per type {by_type} (floor equivalent s {scale_report['s_equivalent_by_type']}, displacement "
+               f"{({k: round(v, 3) for k, v in scale_report['displacement_by_type'].items()})})" if by_type else
+               f"[scale] t = {scale:.5f} (uniform floor equivalent s = {scale_report['s_equivalent']:.4f})")
+              + f"; displacement {scale_report['displacement']:.3f} of {scale_report['displacement_t1']:.3f} at t = 1"
+              + (f"; forget loss {scale_report['forget_loss']:.4f} for the holdout target {holdout_init:.4f} after "
+                 f"{len(search)} evaluations" if holdout_init is not None else ""))
+        print("[control] scaled update: every target moved by its t times its warm-start update")
+        results["warm_start_scale"] = scale_report
+        del starred, init_w
+    if args.variant == "unrestricted" and args.s_min == 1.0:
+        # Positive control: s = max(cos, 1) = 1 for every row, so phase one leaves the start model as it is.
+        moved = [n for n, r in ws_report.items() if r["weight_rel_change"] != 0.0]
+        if moved:
+            raise RuntimeError(f"s_min = 1 changed {len(moved)} targets, e.g. {moved[:3]}")
+        print("[control] s_min = 1: phase one left every target unchanged; phase two starts from --base_id")
     del grad_retain, grad_forget, source, input_filters, whitening, covs, covs_forget
     torch.cuda.empty_cache()
     ws_summary = summarize_by_projection(ws_report)
@@ -683,7 +940,38 @@ def main():
                                 "kl_per_microbatch": kl_log}
         del trainer
         torch.cuda.empty_cache()
+    if args.save_model_dir:
+        with Stage("save model", timings):
+            model.save_pretrained(args.save_model_dir)
+            tok.save_pretrained(args.save_model_dir)
+        print(f"[save] model ({args.train_dtype}) and tokenizer -> {args.save_model_dir}")
+        results["saved_model"] = args.save_model_dir
     save_results()
+
+    if full_grads is not None:
+        with Stage("losses after phase two", timings):
+            after = {"forget": mean_loss(forget), "retain": mean_loss(retain)}
+        params = dict(model.named_parameters())
+        update = {}
+        for scope, names in (("targets", sorted(n + ".weight" for n in targets)), ("all", sorted(init_state))):
+            sq, dot_f, dot_r = 0.0, 0.0, 0.0
+            for n in names:
+                d = params[n].detach().to("cpu", torch.float64) - init_state[n].double()
+                sq += float(d.square().sum())
+                dot_f += float((full_grads["forget"][n].double() * d).sum())
+                dot_r += float((full_grads["retain"][n].double() * d).sum())
+            update[scope] = {"tensors": len(names), "update_norm": sq ** 0.5, "predicted_forget_change": dot_f,
+                             "predicted_retain_change": dot_r}
+        actual = {side: after[side] - losses_before[side] for side in after}
+        print(f"[phase-two check] loss forget {losses_before['forget']:.4f} -> {after['forget']:.4f} ({actual['forget']:+.4f}), "
+              f"retain {losses_before['retain']:.4f} -> {after['retain']:.4f} ({actual['retain']:+.4f}); " + "; ".join(
+                  f"{scope} ({u['tensors']} tensors): ||theta - theta_Init|| {u['update_norm']:.3f}, predicted forget "
+                  f"{u['predicted_forget_change']:+.4f} retain {u['predicted_retain_change']:+.4f}"
+                  for scope, u in update.items()))
+        results["components"]["phase_two_check"] = {"loss_init": losses_before, "loss_after": after,
+                                                     "actual_change": actual, "update": update}
+        del full_grads, init_state, params
+        save_results()
 
     # ---------------- evaluation ----------------
     model.eval()
@@ -712,7 +1000,11 @@ def main():
 
     run.log({**{f"scores/{c}": scores[c] for c in COLUMNS}, **{f"phase_two/{k}": v for k, v in change.items()
                                                                if isinstance(v, (int, float))}})
-    run.summary.update({"timings_s": timings, "warm_start": to_jsonable(ws_summary), "row": row})
+    results["cuda_max_memory_gb"] = torch.cuda.max_memory_allocated() / 2 ** 30
+    save_results()
+    run.summary.update({"timings_s": timings, "warm_start": to_jsonable(ws_summary), "row": row,
+                        "cuda_max_memory_gb": results["cuda_max_memory_gb"],
+                        **({"components": to_jsonable(results["components"])} if "components" in results else {})})
     run.finish()
 
 

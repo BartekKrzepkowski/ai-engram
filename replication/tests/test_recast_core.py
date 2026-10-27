@@ -601,3 +601,232 @@ def test_forget_output_budget_picks_smallest_rank_reaching_target():
                                                                               layer_scaling="subspace_norm")):
         with pytest.raises(ValueError):
             R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.9, forget_output_target=0.1, **bad)
+
+
+def _component_case(seed, out=7, inn=9, r=4, scale=1.0):
+    gen = torch.Generator().manual_seed(seed)
+    u = torch.linalg.qr(torch.randn(out, r, generator=gen, dtype=torch.float64))[0]
+    vh = torch.linalg.qr(torch.randn(inn, r, generator=gen, dtype=torch.float64))[0].T
+    x = scale * torch.randn(out, inn, generator=gen, dtype=torch.float64)
+    g = torch.randn(out, inn, generator=gen, dtype=torch.float64)
+    return u, vh, x, g
+
+
+def test_component_reconstruction_equals_projected_update():  # 1
+    for u_free in (False, True):
+        u, vh, x, g = _component_case(30)
+        u = None if u_free else u
+        parts = R.decompose_update(x, u, vh, g)
+        full = R.compose_update(parts, torch.ones_like(parts.sigma))
+        direct = R.project(x, u, vh).double()
+        assert torch.allclose(full, direct, atol=1e-6), u_free
+        assert parts.sigma.numel() == min(vh.shape[0], x.shape[0] if u is None else u.shape[1])
+
+
+def test_component_contributions_and_their_sum():  # 2, 3
+    u, vh, x, g = _component_case(31)
+    parts = R.decompose_update(x, u, vh, g)
+    for j in range(parts.sigma.numel()):
+        d_j = parts.sigma[j] * torch.outer(parts.left[:, j], parts.right[j])
+        assert abs(float((g * d_j).sum()) - float(parts.contribution[j])) < 1e-10
+    assert abs(float(parts.contribution.sum()) - float((g * R.project(x, u, vh).double()).sum())) < 1e-6
+
+
+def test_components_are_orthogonal_and_energy_decomposes():  # 4, 5
+    u, vh, x, g = _component_case(32)
+    parts = R.decompose_update(x, u, vh, g)
+    k = parts.sigma.numel()
+    comps = [parts.sigma[j] * torch.outer(parts.left[:, j], parts.right[j]) for j in range(k)]
+    for i in range(k):
+        for j in range(k):
+            inner = float((comps[i] * comps[j]).sum())
+            assert abs(inner - (float(parts.sigma[i]) ** 2 if i == j else 0.0)) < 1e-9
+    alpha = torch.tensor([1.0, 0.5, 0.0, 0.25], dtype=torch.float64)
+    upd = R.compose_update(parts, alpha)
+    assert abs(float(upd.square().sum()) - float((alpha.square() * parts.sigma.square()).sum())) < 1e-9
+
+
+def test_signed_mask_keeps_positive_components_only():  # 6
+    u, vh, x, g = _component_case(33)
+    parts = R.decompose_update(x, u, vh, g)
+    alpha = R.component_weights(parts, "signed")
+    assert torch.equal(alpha > 0, parts.contribution > 0)
+    signed = R.compose_update(parts, alpha)
+    expect = sum(parts.sigma[j] * torch.outer(parts.left[:, j], parts.right[j])
+                 for j in range(parts.sigma.numel()) if parts.contribution[j] > 0)
+    assert torch.allclose(signed, expect, atol=1e-10)
+    assert float((g * signed).sum()) >= float((g * R.compose_update(parts, torch.ones_like(alpha))).sum()) - 1e-12
+    gamma = R.component_weights(parts, "uniform_matched")
+    assert torch.allclose(R.compose_update(parts, gamma).norm(), signed.norm(), atol=1e-10)  # equal displacement
+
+
+def test_zero_gradient_and_zero_update_cases():  # 7
+    u, vh, x, g = _component_case(34)
+    parts = R.decompose_update(x, u, vh, torch.zeros_like(g))
+    assert torch.all(parts.contribution == 0)
+    for sel in ("signed", "random", "uniform_matched"):
+        alpha = R.component_weights(parts, sel, torch.Generator().manual_seed(0))
+        assert float(alpha.abs().sum()) == 0.0 and torch.all(R.compose_update(parts, alpha) == 0), sel
+    zero = R.decompose_update(torch.zeros_like(x), u, vh, g)
+    assert torch.all(zero.sigma == 0) and torch.isfinite(zero.contribution).all()
+    assert float(R.component_weights(zero, "uniform_matched").abs().sum()) == 0.0
+    assert R.effective_rank(zero.sigma) == 0.0
+    # warm start: s_min 1 (no shrink) gives a zero proposal; every selection leaves the weights unchanged
+    t = R.select_targets(Toy(), "decoder_linear")
+    w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+    gen = torch.Generator().manual_seed(35)
+    gr = {k: torch.randn(6, 6, generator=gen) for k in t}
+    src = {k: torch.randn(6, 6, generator=gen) for k in t}
+    _, rep = R.warm_start(t, gr, 1.0, src, 0.9, component_selection="signed", component_diagnostics=True)
+    assert all(torch.equal(t[k].weight, w0[k]) for k in t) and all(rep[k]["components"]["energy"] == 0 for k in t)
+
+
+def test_small_singular_values_stay_finite():  # 8
+    u, vh, x, g = _component_case(36)
+    tiny = R.project(x, u, vh).double()
+    p, _, qh = torch.linalg.svd(u.T @ tiny @ vh.T)
+    x_small = u @ p @ torch.diag(torch.tensor([1.0, 1e-9, 1e-14, 0.0], dtype=torch.float64)) @ qh @ vh
+    parts = R.decompose_update(x_small, u, vh, g)
+    assert torch.isfinite(parts.sigma).all() and torch.isfinite(parts.contribution).all()
+    assert torch.allclose(R.compose_update(parts, torch.ones_like(parts.sigma)), x_small, atol=1e-10)
+    assert abs(float(parts.contribution[-1])) < 1e-12  # a zero component has no first-order effect
+    assert 1.0 <= R.effective_rank(parts.sigma) < 1.01
+
+
+def test_random_control_is_deterministic_and_matches_signed_count():  # 9
+    u, vh, x, g = _component_case(37, out=12, inn=15, r=10)
+    parts = R.decompose_update(x, u, vh, g)
+    n_pos = int((parts.contribution > 0).sum())
+    a1 = R.component_weights(parts, "random", torch.Generator().manual_seed(5))
+    a2 = R.component_weights(parts, "random", torch.Generator().manual_seed(5))
+    a3 = R.component_weights(parts, "random", torch.Generator().manual_seed(6))
+    assert torch.equal(a1, a2) and int(a1.sum()) == int(a3.sum()) == n_pos
+    assert not torch.equal(a1, a3) or n_pos in (0, parts.sigma.numel())
+    t = R.select_targets(Toy(), "decoder_linear")
+    gen = torch.Generator().manual_seed(38)
+    gr = {k: torch.randn(6, 6, generator=gen) for k in t}
+    src = {k: torch.randn(6, 6, generator=gen) for k in t}
+    runs = []
+    for _ in range(2):  # the same seed twice: the same masks
+        torch.manual_seed(39)
+        t2 = R.select_targets(Toy(), "decoder_linear")
+        R.warm_start(t2, gr, 0.3, src, 0.9, component_selection="random", component_seed=1)
+        runs.append({k: v.weight.detach().clone() for k, v in t2.items()})
+    assert all(torch.equal(runs[0][k], runs[1][k]) for k in runs[0])
+
+
+def test_component_modes_default_and_full_reproduce_the_old_update():  # 10
+    gen = torch.Generator().manual_seed(40)
+    gr = {f"model.layers.{i}.{p}": torch.randn(6, 6, generator=gen) for i in range(2) for p in ("q_proj", "down_proj")}
+    src = {k: torch.randn(6, 6, generator=gen) for k in gr}
+    xs = {k: torch.randn(50, 6, generator=gen) for k in gr}
+    cov_f = {k: x.T @ x / 50 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(6, generator=gen) + 0.1) for k in gr}
+    extra = dict(whitening_rho=1.0, representation_output="gradient", forget_covariances=cov_f,
+                 retain_covariances=cov_r, rank_multiplier=1.25)
+    weights = {}
+    for label, kw in (("old", {}), ("diag", dict(component_diagnostics=True)), ("full", dict(component_selection="full")),
+                      ("signed", dict(component_selection="signed", component_diagnostics=True)),
+                      ("matched", dict(component_selection="uniform_matched"))):
+        torch.manual_seed(41)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        _, rep = R.warm_start(t, gr, 0.3, src, 0.9, **extra, **kw)
+        weights[label] = ({k: v.weight.detach().clone() for k, v in t.items()}, rep, w0)
+    old, _, w0 = weights["old"]
+    assert all(torch.equal(weights["diag"][0][k], old[k]) for k in old)  # diagnostics alone change nothing
+    assert all(torch.allclose(weights["full"][0][k], old[k], atol=1e-6) for k in old)
+    for k in old:
+        c = weights["signed"][1][k]["components"]
+        assert c["kept"] == c["positive"] and c["reconstruction_rel_error"] < 1e-5  # fp32 projection vs fp64 sum
+        assert abs(c["contribution_sum"] - c["first_order_forget_direct"]) < 1e-5 * max(1.0, abs(c["contribution_sum"]))
+        signed_norm = float((weights["signed"][0][k] - w0[k]).norm())
+        matched_norm = float((weights["matched"][0][k] - w0[k]).norm())
+        assert abs(signed_norm - matched_norm) < 1e-5 * max(1.0, signed_norm)
+        assert len(c["sigma"]) == len(c["contribution"]) == c["components"]
+    with pytest.raises(ValueError):
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, component_selection="signed")
+    with pytest.raises(ValueError):
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.9, component_selection="best")
+
+
+def test_component_control_holds_for_a_near_zero_fp32_update():
+    """The fp32 projection of a large proposal onto a direction it barely touches loses relative digits; the fp64
+    components still match it to fp32 rounding of the proposal, and sum c_j matches <G, P(X)> within ||G|| times
+    the reconstruction gap (the control of recast_tofu.py)."""
+    gen = torch.Generator().manual_seed(42)
+    u = torch.linalg.qr(torch.randn(64, 1, generator=gen, dtype=torch.float64))[0]
+    vh = torch.linalg.qr(torch.randn(256, 1, generator=gen, dtype=torch.float64))[0].T
+    y = 10.0 * torch.randn(64, 256, generator=gen, dtype=torch.float64)
+    x = (y - u @ (u.T @ y @ vh.T) @ vh + 1e-6 * u @ vh).float()  # core ~1e-6 against entries ~10
+    g = torch.randn(64, 256, generator=gen)
+    delta = R.project(x, u.float(), vh.float())
+    parts = R.decompose_update(x, u.float(), vh.float(), g)
+    alpha = torch.ones_like(parts.sigma)
+    rep = R.component_report(parts, alpha, delta, R.compose_update(parts, alpha), g, g, keep_arrays=False)
+    assert rep["reconstruction_abs_error"] <= 1e-5 * float(x.norm())
+    gap = abs(rep["contribution_sum"] - rep["first_order_forget_direct"])
+    assert gap <= rep["grad_forget_norm"] * rep["reconstruction_abs_error"] + 1e-6 * abs(rep["first_order_forget_direct"]) + 1e-12
+
+
+def test_input_contrast_and_direction_weights():
+    e = torch.eye(8, dtype=torch.float64)
+    cf = torch.diag(torch.tensor([4.0, 1, 1, 1, 1, 1, 1, 1], dtype=torch.float64))
+    cr = torch.eye(8, dtype=torch.float64)
+    k = R.input_contrast(e[:2], cf, cr)  # (4/11)/(1/8), (1/11)/(1/8)
+    assert torch.allclose(k, torch.tensor([32 / 11, 8 / 11], dtype=torch.float64))
+    w = R.direction_contrast_weights(e[:2], cf, cr, 0.3)  # k / mean(k) = 1.6, 0.4; 1.6 capped at 1 / 0.7
+    assert torch.allclose(w, torch.tensor([1 / 0.7, 0.4], dtype=torch.float64))
+    gen = torch.Generator().manual_seed(50)
+    a = torch.randn(30, 8, generator=gen, dtype=torch.float64)
+    c = a.T @ a / 30
+    vh = torch.linalg.qr(torch.randn(8, 3, generator=gen, dtype=torch.float64))[0].T
+    assert torch.allclose(R.input_contrast(vh, c, 3.0 * c), torch.ones(3, dtype=torch.float64), atol=1e-10)
+    assert torch.allclose(R.direction_contrast_weights(vh, c, 2.0 * c, 0.3), torch.ones(3, dtype=torch.float64))
+
+
+def test_direction_weighting_and_contrast_selection_in_warm_start():
+    gen = torch.Generator().manual_seed(51)
+    names = [f"model.layers.{i}.{p}" for i in range(2) for p in ("q_proj", "down_proj")]
+    gr = {k: torch.randn(6, 6, generator=gen) for k in names}
+    src = {k: torch.randn(6, 6, generator=gen) for k in names}
+    xs = {k: torch.randn(50, 6, generator=gen) * torch.linspace(0.5, 2.0, 6) for k in names}
+    cov_f = {k: x.T @ x / 50 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(6, generator=gen) + 0.1) for k in names}
+    runs = {}
+    for label, kw in (("plain", {}), ("dirw", dict(direction_weighting="contrast")),
+                      ("contrast", dict(component_selection="contrast"))):
+        torch.manual_seed(52)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        restr, rep = R.warm_start(t, gr, 0.3, src, 0.9, forget_covariances=cov_f, retain_covariances=cov_r, **kw)
+        runs[label] = ({k: v.weight.detach() - w0[k] for k, v in t.items()}, restr, rep)
+    for k in names:
+        vh = runs["plain"][1][k].basis.vh.float()
+        w = R.direction_contrast_weights(vh, cov_f[k], cov_r[k], 0.3).float()
+        expect = ((runs["plain"][0][k] @ vh.T) * w) @ vh
+        assert torch.allclose(runs["dirw"][0][k], expect, atol=1e-5)
+        assert abs(runs["dirw"][2][k]["direction_weights"]["mean"] - float(w.mean())) < 1e-6
+        # P(X) has the same core U^T X Vh^T as X, so its components are those warm_start decomposed
+        parts = R.decompose_update(runs["plain"][0][k], runs["plain"][1][k].basis.u, runs["plain"][1][k].basis.vh, src[k])
+        kept = int((R.input_contrast(parts.right, cov_f[k], cov_r[k]) > 1).sum())
+        assert runs["contrast"][2][k]["components"]["kept"] == kept
+    with pytest.raises(ValueError):
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.9, direction_weighting="contrast")
+
+
+def test_scale_update_is_linear_from_init():
+    gen = torch.Generator().manual_seed(53)
+    w0, ws = torch.randn(5, 7, generator=gen), torch.randn(5, 7, generator=gen)
+    assert torch.equal(R.scale_update(w0, ws, 0.0), w0)
+    assert torch.allclose(R.scale_update(w0, ws, 1.0), ws, atol=1e-6)
+    for t in (0.01, 0.35, 1.4):
+        assert abs(float((R.scale_update(w0, ws, t) - w0).norm()) - t * float((ws - w0).norm())) < 1e-5
+
+
+def test_parse_type_scales():
+    assert R.parse_type_scales("down_proj=1,up_proj=0.714286, o_proj=0.5") == {
+        "down_proj": 1.0, "up_proj": 0.714286, "o_proj": 0.5}
+    for bad in ("down_proj", "down_proj=1,down_proj=2", "=1", "down_proj=x"):
+        with pytest.raises(ValueError):
+            R.parse_type_scales(bad)

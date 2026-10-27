@@ -9,6 +9,10 @@
 # MAX_GRAD_NORM=0 disables gradient clipping in the Hugging Face Trainer. EPOCHS=0 in --export evaluates the
 # warm start alone (no phase two); the default is 10. TRAJECTORY=nll in --export also tracks the answer NLL and
 # exact memorization of forget, retain_perturbed, real authors and world facts before phase two and after every epoch.
+# COMPONENT_DIAGNOSTICS=yes in --export writes the per-target update components and the first-order loss check.
+# BASE_ID=<model id or directory> (with BASE_TAG=<name for the run name>) in --export starts from another model than
+# Init Fine., e.g. a saved Engram edit; with VARIANTS=(unrestricted) and S_MINS=(1.0) phase one is the identity and the
+# run is phase two alone. SAVE_MODEL_SEED=<seed> in --export saves that seed's model after phase two.
 #SBATCH --job-name=ai-engram-recast
 #SBATCH --account=plgreprunlearn-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
@@ -44,10 +48,10 @@ export TOKENIZERS_PARALLELISM=false
 # replication/docs/WORK_LOG.md. Axes, outermost first: variant, profile, floor, EVR, seed,
 # learning rate, retain loss, retain input filter, ablation.
 # restricted_shrink: the restricted warm start without adapters, phase two on every parameter.
-VARIANTS=(restricted_semu)
+VARIANTS=(restricted_shrink)
 PROFILES=(down_up_o)
 S_MINS=(0.3)
-EVRS=(0.98)
+EVRS=(0.97)
 SEEDS=(0)
 # Learning-rate schedules, peak|points|name: warmup to the peak in epoch 1, the peak until epoch 5,
 # then a step down to 1e-5 (user, 2026-10-22). Runs up to 24990942 went linearly from the peak at
@@ -67,7 +71,7 @@ FILTERS=(repr/30/gradient)
 # Edit budget (restricted only): none (rank from EVR), m (rank = round(m * plain-basis rank at EVR) per
 # target, the same for the plain and the whitened basis) or qf/<q> (per target the smallest rank whose
 # warm-start delta changes forget outputs by tr(D C_f D^T) / tr(W C_f W^T) >= q).
-RANK_MULTS=(1)
+RANK_MULTS=(1.25)
 # Independent ablations against the reference (full_space alignment, forget_only source, no
 # layer scaling): each changes exactly one factor. Format: scope:source:scaling:phase2_free:tag.
 # phase2_free (restricted_semu only, ignored otherwise): none, norms, attention, mlp or all (every
@@ -78,10 +82,21 @@ RANK_MULTS=(1)
 ABLATIONS=(
     "full_space:forget_only:none:all:free_all"
 )
+# Components of the projected update (restricted only, innermost axis): none (the original update), full (its SVD
+# reconstruction), signed (only components with c_j = <G_f, D_j> > 0), random (as many, drawn with the seed) or
+# uniform_matched (the original update scaled to the signed update's norm).
+COMPONENT_MODES=(signed)
+# Warm-start variants (restricted only, next-to-innermost axis): none, scale/<t> (W_Init + t (W* - W_Init)),
+# scale/holdout (t chosen by forward passes so that the forget loss equals the Init Fine. holdout loss),
+# types/<projection>=<t>,... (scale/<t> per projection type, every type of the profile listed) or
+# dirw/contrast (per-direction shrink weighted by the forget / retain input-energy contrast).
+WARM_STARTS=(scale/1.428571)
 BLOCKS=all
 EPOCHS="${EPOCHS:-10}"
 TASK="${SLURM_ARRAY_TASK_ID:?run as an array task}"
 i=${TASK}
+COMP="${COMPONENT_MODES[$((i % ${#COMPONENT_MODES[@]}))]}"; i=$((i / ${#COMPONENT_MODES[@]}))
+IFS=/ read -r WS_KIND WS_VALUE <<< "${WARM_STARTS[$((i % ${#WARM_STARTS[@]}))]}"; i=$((i / ${#WARM_STARTS[@]}))
 IFS=: read -r SCOPE SOURCE SCALING FREE ABL_TAG <<< "${ABLATIONS[$((i % ${#ABLATIONS[@]}))]}"; i=$((i / ${#ABLATIONS[@]}))
 IFS=/ read -r FILTER KAPPA FOUT FMIX <<< "${FILTERS[$((i % ${#FILTERS[@]}))]}"; i=$((i / ${#FILTERS[@]}))
 RANK_MULT="${RANK_MULTS[$((i % ${#RANK_MULTS[@]}))]}"; i=$((i / ${#RANK_MULTS[@]}))
@@ -106,6 +121,15 @@ case "${RANK_MULT}" in
 esac
 EP_TAG=""
 [[ "${EPOCHS}" == "0" ]] && EP_TAG="_warmstartonly"
+[[ "${COMP}" != none ]] && FILTER_TAG="${FILTER_TAG}_comp${COMP}"
+if [[ "${WS_KIND}" == types ]]; then
+    FILTER_TAG="${FILTER_TAG}_types_$(sed 's/_proj//g; s/\./p/g; s/=//g; s/,/_/g' <<< "${WS_VALUE}")"
+elif [[ "${WS_KIND}" != none ]]; then
+    FILTER_TAG="${FILTER_TAG}_${WS_KIND}${WS_VALUE/./p}"
+fi
+BASE_ID="${BASE_ID:-open-unlearning/tofu_Llama-3.2-1B-Instruct_full}"
+BASE_TAG="${BASE_TAG:-}"
+[[ "${BASE_ID}" != open-unlearning/tofu_Llama-3.2-1B-Instruct_full && -z "${BASE_TAG}" ]] && { echo "ERROR: set BASE_TAG for BASE_ID=${BASE_ID}" >&2; exit 1; }
 TRAJ_ARGS=()
 if [[ -n "${TRAJECTORY:-}" ]]; then
     TRAJ_ARGS=(--eval_trajectory "${TRAJECTORY}")
@@ -117,8 +141,12 @@ CLIP_TAG="${MAX_GRAD_NORM/./p}"
 [[ "${MAX_GRAD_NORM}" == "0" ]] && CLIP_TAG=none
 # Init Fine. and Retain raw metrics: Table 3 run 24952059 (same evaluation code and environment).
 ANCHORS_RAW="${STORAGE}/experiment_results/ai-engram/table3/table3_forget10_seed0_24952059/raw_metrics.json"
-RUN_NAME="recast_${VARIANT}_${PROFILE}_blocks${BLOCKS}_tied_smin${S_TAG}_evr${E_TAG}_${ABL_TAG}_${FILTER_TAG}_lr${LR_NAME}_${LOSS_TAG}_seed${SEED}_${EPOCH_LENGTH}_${TRAIN_DTYPE}_clip${CLIP_TAG}${EP_TAG}_${SLURM_ARRAY_JOB_ID:-local}_${TASK}"
+RUN_NAME="recast_${BASE_TAG:+${BASE_TAG}_}${VARIANT}_${PROFILE}_blocks${BLOCKS}_tied_smin${S_TAG}_evr${E_TAG}_${ABL_TAG}_${FILTER_TAG}_lr${LR_NAME}_${LOSS_TAG}_seed${SEED}_${EPOCH_LENGTH}_${TRAIN_DTYPE}_clip${CLIP_TAG}${EP_TAG}_${SLURM_ARRAY_JOB_ID:-local}_${TASK}"
 OUT_DIR="${STORAGE}/experiment_results/ai-engram/recast_tofu/${RUN_NAME}"
+SAVE_ARGS=()
+if [[ -n "${SAVE_MODEL_SEED:-}" && "${SEED}" == "${SAVE_MODEL_SEED}" ]]; then
+    SAVE_ARGS=(--save_model_dir "${STORAGE}/runtime_artifacts/ai-engram/recast_tofu/models/${RUN_NAME}")
+fi
 
 VARIANT_ARGS=(--freeze_input_embedding no --shrink_layer_scaling "${SCALING}")
 VARIANT_TAGS=(variant_unrestricted "scaling_${SCALING}")
@@ -141,6 +169,16 @@ if [[ "${VARIANT}" == restricted_* ]]; then
         qf/*) VARIANT_ARGS+=(--restriction_forget_output_target "${RANK_MULT#qf/}") ;;
         *) VARIANT_ARGS+=(--restriction_rank_multiplier "${RANK_MULT}") ;;
     esac
+    [[ "${COMP}" != none ]] && VARIANT_ARGS+=(--component_selection "${COMP}")
+    case "${WS_KIND}" in
+        none) ;;
+        scale) if [[ "${WS_VALUE}" == holdout ]]; then VARIANT_ARGS+=(--warm_start_scale_target holdout)
+               else VARIANT_ARGS+=(--warm_start_scale "${WS_VALUE:?give t as scale/t}"); fi ;;
+        types) VARIANT_ARGS+=(--warm_start_scale_by_type "${WS_VALUE:?give types/<projection>=<t>,...}") ;;
+        dirw) VARIANT_ARGS+=(--direction_weighting "${WS_VALUE:?give dirw/contrast}") ;;
+        *) echo "ERROR: unknown warm-start variant ${WS_KIND}" >&2; exit 1 ;;
+    esac
+    [[ "${COMPONENT_DIAGNOSTICS:-}" == yes ]] && VARIANT_ARGS+=(--component_diagnostics yes)
     VARIANT_TAGS=("variant_${VARIANT}" "source_${SOURCE}" "evr_${E_TAG}" "align_${SCOPE}" "scaling_${SCALING}" "${ABL_TAG}"
                   "${FILTER_TAG}")
     if [[ "${VARIANT}" == "restricted_semu" ]]; then
@@ -150,7 +188,7 @@ if [[ "${VARIANT}" == restricted_* ]]; then
 fi
 
 echo "[launch] host=$(hostname) job=${SLURM_ARRAY_JOB_ID:-none}_${TASK} git=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown) branch=$(git -C "${REPO_ROOT}" branch --show-current 2>/dev/null || echo unknown)"
-echo "[launch] variant=${VARIANT} profile=${PROFILE} s_min=${S_MIN} epoch_length=${EPOCH_LENGTH} train_dtype=${TRAIN_DTYPE} max_grad_norm=${MAX_GRAD_NORM} out_dir=${OUT_DIR}"
+echo "[launch] base=${BASE_ID} variant=${VARIANT} profile=${PROFILE} s_min=${S_MIN} epoch_length=${EPOCH_LENGTH} train_dtype=${TRAIN_DTYPE} max_grad_norm=${MAX_GRAD_NORM} out_dir=${OUT_DIR}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "[launch] nvidia-smi unavailable"
 
 cd "${REPO_ROOT}"
@@ -158,7 +196,7 @@ echo "[gate] recast_core parity tests (CPU)"
 "${PY}" -m pytest -q -p no:cacheprovider replication/tests/test_recast_core.py
 
 "${PY}" -u replication/scripts/recast_tofu.py \
-    --base_id open-unlearning/tofu_Llama-3.2-1B-Instruct_full \
+    --base_id "${BASE_ID}" \
     --dataset_id locuslab/TOFU \
     --forget_split forget10 \
     --retain_split retain90 \
@@ -190,11 +228,12 @@ echo "[gate] recast_core parity tests (CPU)"
     --eval_batch_size 16 \
     --anchors_raw "${ANCHORS_RAW}" \
     --out_dir "${OUT_DIR}" \
+    "${SAVE_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
     --wandb_mode online \
     --wandb_project "${WANDB_PROJECT}" \
     --wandb_tags recast_tofu_comparison matched_protocol method_recast \
-        model_tofu_llama3p2_1b_instruct split_forget10 "${VARIANT_TAGS[@]}" "smin_${S_TAG}" \
+        model_tofu_llama3p2_1b_instruct split_forget10 "base_${BASE_TAG:-init_fine}" "${VARIANT_TAGS[@]}" "smin_${S_TAG}" \
         phase2_retain_only "retain_loss_${LOSS_TAG}" optim_adamw_torch "lr_peak_${LR_PEAK}" "lr_${LR_NAME}" wd_0p01 "epochs_${EPOCHS}" "epoch_len_${EPOCH_LENGTH}" \
         "dtype_${TRAIN_DTYPE}" grad_views_1 "targets_${PROFILE}" "blocks_${BLOCKS}" head_no_shrink_trained lm_head_tied embedding_trained "grad_clip_${CLIP_TAG}" "seed_${SEED}"
 
