@@ -18,15 +18,24 @@ import os
 import statistics
 
 COLUMNS = ["Memorization", "Utility", "Privacy", "EM", "FQ", "Overall"]
-# eval_trajectory, component_diagnostics and save_model_dir only add measurements or files; the trained model is the same
+# eval_trajectory and the component, score and core diagnostics and save_model_dir only add measurements or files; the
+# trained model is the same
 BOOKKEEPING = {"seed", "out_dir", "run_name", "wandb_tags", "wandb_mode", "wandb_project", "anchors_raw", "eval_trajectory",
-               "component_diagnostics", "save_model_dir"}
-SHOWN = ["base_id", "variant", "targets", "target_blocks", "s_min", "restriction_evr", "restriction_source",
+               "component_diagnostics", "score_diagnostics", "core_diagnostics", "contraction_diagnostics",
+               "save_model_dir"}
+GATE_KEYS = ("basis", "rho", "candidates", "optim", "lr", "max_epochs", "convergence_epochs", "tol", "drift_max",
+             "probe_retain", "micro_batch", "grad_accum", "alpha", "gamma", "beta", "autocast", "binarize_share",
+             "binary_s", "lambda_star", "init", "cut", "cut_s", "rotate_evr", "lr_schedule", "probe_every")
+SHOWN = ["base_id", "phase_one_dtype", "train_dtype", "variant", "targets", "target_blocks", "s_min", "restriction_evr",
+         "restriction_source",
          "restriction_alignment_scope", "shrink_layer_scaling", "phase2_free", "untie_lm_head", "train_lm_head", "lr",
          "lr_scheduler", "lr_points", "epochs", "max_grad_norm", "retain_loss", "kl_weight", "retain_input_filter",
          "retain_filter_kappa", "restriction_whitening", "whitening_rho", "restriction_representation",
          "representation_mix", "restriction_rank_multiplier", "restriction_forget_output_target", "component_selection",
-         "warm_start_scale", "warm_start_scale_target", "warm_start_scale_by_type", "direction_weighting"]
+         "warm_start_scale", "warm_start_scale_target", "warm_start_scale_by_type", "direction_weighting",
+         "deepspeed_config", "optim", "per_device_batch_size", "grad_accum", "gradient_checkpointing",
+         "loss_normalization", "shrink_score", "weight_contraction", "contraction_strength", "contraction_residual",
+         *(f"direction_gates_{k}" for k in GATE_KEYS)]
 
 
 def parse_args():
@@ -41,8 +50,11 @@ def parse_args():
 def with_defaults(run_args):
     """Runs older than an argument ran its present default; fill it in so equal configurations group together."""
     a = dict(run_args)
-    defaults = {"retain_loss": "nll", "target_blocks": "all"}
-    if a.get("variant") != "unrestricted":
+    gated = a.get("variant") == "direction_gates"  # no ReCAST update: no shrink or restriction arguments
+    defaults = {"retain_loss": "nll", "target_blocks": "all", "phase_one_dtype": a.get("train_dtype"),
+                "gradient_checkpointing": "no", "loss_normalization": "window_tokens",
+                **({} if gated else {"shrink_score": "original"})}
+    if a.get("variant") not in ("unrestricted", "direction_gates"):
         defaults.update({"retain_input_filter": "none", "restriction_whitening": "none",
                          "restriction_representation": "none", "shrink_layer_scaling": "none",
                          "restriction_alignment_scope": "full_space"})
@@ -104,6 +116,8 @@ def main():
               f"rankx={c['restriction_rank_multiplier'] or '-'} qf={c['restriction_forget_output_target'] or '-'} "
               f"components={c['component_selection'] or '-'} scale={c['warm_start_scale_target'] or c['warm_start_scale'] or '-'} "
               f"dirw={c['direction_weighting'] or '-'}"
+              + ("" if c["variant"] != "direction_gates" else
+                 " gates=" + "/".join(f"{k}:{c['direction_gates_' + k]}" for k in GATE_KEYS))
               + (f" (repeats dropped: {', '.join(r['repeats_dropped'])})" if r["repeats_dropped"] else ""))
         print("    " + "  ".join(f"{col} {r['stats'][col]['mean']:.4f}±{r['stats'][col]['std']:.4f}" for col in COLUMNS))
         print("    Overall per seed: " + ", ".join(f"{v:.4f}" for v in r["stats"]["Overall"]["values"]))
