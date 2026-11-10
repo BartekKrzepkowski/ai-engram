@@ -121,7 +121,10 @@
   `replication/logs` is a symlink to storage (`CLUSTER_ENVIRONMENT.md`).
   The ReCAST port is the library `replication/scripts/recast_core.py`, the
   command `replication/scripts/recast_tofu.py` and the tests
-  `replication/tests/test_recast_core.py`.
+  `replication/tests/test_recast_core.py`. Its extensions beyond the porting
+  contract (their modules, flags, launchers, tests and results) are described
+  in `replication/docs/RECAST_EXTENSIONS.md`; keep it current when an
+  extension is added or changed.
 - The package is installed into the environment editable from this checkout
   without dependencies, so a job runs the checked-out code with the pinned
   dependencies. Every run records the git commit and branch it ran.
