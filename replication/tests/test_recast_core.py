@@ -1,6 +1,7 @@
 """CPU parity tests for replication/scripts/recast_core.py (RECAST_PORTING_CONTRACT.md, section
 "Required parity tests for every port"). Run on a compute node: they import torch."""
 
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -59,6 +60,11 @@ def test_target_profiles():
         R.select_targets(m, "mlp_up_gate")
     with pytest.raises(ValueError):  # the toy has no up_proj
         R.select_targets(m, "mlp_up")
+    assert set(R.select_targets(m, "down_o")) == blocks(("down_proj",))  # the toy has no o_proj
+    with pytest.raises(ValueError):  # the toy has neither up_proj nor o_proj
+        R.select_targets(m, "up_o")
+    assert R.TARGET_PROFILES["down_o"] == (("down_proj", "o_proj"), False)
+    assert R.TARGET_PROFILES["up_o"] == (("up_proj", "o_proj"), False)
 
 
 def test_mean_gradient_is_example_weighted_and_state_restored():
@@ -515,6 +521,252 @@ def test_representation_basis_picks_forget_heavy_inputs():
         R.representation_basis(g, cov_forget, cov_retain, w, rank=1, rho=0.01, output_side="both")
 
 
+def test_gradient_contrast_basis_prefers_forget_only_directions():
+    # G_f is largest along (e0, e0) but G_r pulls there too; (e1, e2) carries less forget energy and no retain.
+    e_out, e_in = torch.eye(4, dtype=torch.float64), torch.eye(5, dtype=torch.float64)
+    g_f = 3.0 * torch.outer(e_out[0], e_in[0]) + 1.0 * torch.outer(e_out[1], e_in[2]) + 0.1 * torch.outer(e_out[2], e_in[3])
+    g_r = 5.0 * torch.outer(e_out[0], e_in[0]) + 0.1 * torch.outer(e_out[3], e_in[4])
+    plain = R.svd_basis(g_f.float(), 0.5)
+    assert plain.rank == 1 and torch.allclose(plain.vh.abs().double(), e_in[0:1], atol=1e-5)
+    both = R.gradient_contrast_basis(g_f, g_r, rank=1, rho=0.1, sides="both")
+    assert both.active and both.rank == 1 and both.total_rank == 4
+    assert torch.allclose(both.vh.abs().double(), e_in[2:3], atol=1e-4)
+    assert torch.allclose(both.u.abs().double(), e_out[:, 1:2], atol=1e-4)
+    assert abs(both.evr - 1.0 / (9.0 + 1.0 + 0.01)) < 1e-4  # ||P(G_f)||^2 / ||G_f||^2
+    inp = R.gradient_contrast_basis(g_f, g_r, rank=1, rho=0.1, sides="input")
+    assert torch.allclose(inp.vh.abs().double(), e_in[2:3], atol=1e-4)
+    assert torch.allclose(inp.u.abs().double(), e_out[:, 0:1], atol=1e-4)  # the plain basis's output side
+    assert inp.evr < 1e-6  # u = e0 and v = e2 hold no forget gradient together
+    for b in (R.gradient_contrast_basis(g_f, g_r, rank=3, rho=1.0, sides=s) for s in ("both", "input")):
+        assert b.rank == 3 and torch.allclose(b.u.T @ b.u, torch.eye(3), atol=1e-5)
+        assert torch.allclose(b.vh @ b.vh.T, torch.eye(3), atol=1e-5)
+    assert R.gradient_contrast_basis(g_f, g_r, rank=9, rho=1.0, sides="both").rank == 4  # clipped to min(out, in)
+    assert not R.gradient_contrast_basis(torch.zeros(4, 5), g_r, rank=1, rho=1.0, sides="both").active
+    for bad in (dict(sides="output"), dict(sides="both", rho=0.0), dict(sides="both", rank=0)):
+        with pytest.raises(ValueError):
+            R.gradient_contrast_basis(g_f, g_r, **{"rank": 1, "rho": 1.0, **bad})
+
+
+def test_warm_start_with_gradient_contrast_bases():
+    torch.manual_seed(31)
+    t = R.select_targets(Toy(), "decoder_linear")
+    w0 = {k: m.weight.detach().clone() for k, m in t.items()}
+    gr = {k: torch.randn(6, 6) for k in t}
+    src = {k: torch.randn(6, 6) for k in t}
+    _, rep = R.warm_start(t, gr, 0.3, src, 0.6, whitening_rho=1.0, gradient_contrast="both", rank_multiplier=1.0)
+    for k, m in t.items():
+        r0 = R.svd_basis(src[k], 0.6).rank
+        b = R.gradient_contrast_basis(src[k], gr[k], r0, 1.0, "both")
+        assert rep[k]["reference_rank"] == r0 and rep[k]["rank"] == r0 and abs(rep[k]["evr"] - b.evr) < 1e-6
+        proposal = (R.shrink_factors(R.row_alignment(w0[k], gr[k]), 0.3) - 1.0).unsqueeze(1) * w0[k]
+        assert torch.allclose(m.weight.detach(), w0[k] + R.project(proposal, b.u, b.vh), atol=1e-5)
+    for bad in (dict(whitening_rho=1.0, gradient_contrast="both", component_selection="full"),  # own-spectrum ranks
+                dict(gradient_contrast="both", rank_multiplier=1.0),  # no rho
+                dict(whitening_rho=1.0, gradient_contrast="output", rank_multiplier=1.0),
+                dict(whitening_rho=1.0, gradient_contrast="both", rank_multiplier=1.0, representation_output="gradient")):
+        with pytest.raises(ValueError):
+            R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.6, **bad)
+    with pytest.raises(ValueError):  # needs a restriction
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, whitening_rho=1.0, gradient_contrast="both",
+                     rank_multiplier=1.0)
+
+
+class SeqLossToy(nn.Module):
+    """Token sequences (batch, time, d) through one block; squared error per valid token, averaged over the batch's
+    valid tokens like a causal LM's mean loss."""
+
+    def __init__(self, d=6):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([Block(d)])
+
+    def terms(self, input_ids, attention_mask, labels):
+        blk = self.model.layers[0]
+        h = blk.down_proj(torch.tanh(blk.q_proj(input_ids)))
+        return (((h - labels) ** 2).sum(-1) * attention_mask).sum(-1)  # one per example
+
+    def forward(self, input_ids, attention_mask, labels):
+        return SimpleNamespace(loss=self.terms(input_ids, attention_mask, labels).sum() / attention_mask.sum())
+
+
+def test_example_gradient_moments_match_per_example_gradients():
+    torch.manual_seed(41)
+    m = SeqLossToy()
+    m.train()
+    t = R.select_targets(m, "decoder_linear")
+    x, y = torch.randn(5, 4, 6), torch.randn(5, 4, 6)
+    mask = torch.ones(5, 4)
+    mask[1, 3:] = 0
+    mask[4, 2:] = 0
+    x[mask == 0] = 50.0  # padding
+    batches = [{"input_ids": x[i:j], "attention_mask": mask[i:j], "labels": y[i:j]} for i, j in ((0, 3), (3, 5))]
+    got, n = R.collect_example_gradient_moments(m, batches, t, lambda b: b)
+    mean, _ = R.collect_mean_gradients(m, batches, t, lambda b: b)
+    assert n == 5
+    weights = [t[k].weight for k in t]
+    per = {k: [] for k in t}
+    for b in batches:  # g_e = B x the gradient of example e's part of the batch's mean loss
+        size = b["input_ids"].shape[0]
+        terms = m.terms(**b) / b["attention_mask"].sum()
+        for e in range(size):
+            for k, g in zip(t, torch.autograd.grad(terms[e], weights, retain_graph=True)):
+                per[k].append(size * g.double())
+    for k in t:
+        g = torch.stack(per[k])
+        assert torch.allclose(g.mean(0), mean[k].double(), atol=1e-6)  # the mean of the g_e is the mean gradient
+        assert torch.allclose(got[k][0], torch.einsum("eij,ekj->ik", g, g) / 5, rtol=1e-4, atol=1e-8)  # E[g g^T]
+        assert torch.allclose(got[k][1], torch.einsum("eji,ejk->ik", g, g) / 5, rtol=1e-4, atol=1e-8)  # E[g^T g]
+    assert m.training and all(p.requires_grad for p in m.parameters()) and all(p.grad is None for p in m.parameters())
+    assert all(not mod._forward_hooks for mod in t.values())
+
+
+def test_gradient_moment_basis_keeps_directions_that_cancel_in_the_mean():
+    e_out, e_in = torch.eye(4, dtype=torch.float64), torch.eye(5, dtype=torch.float64)
+    a, b = 3.0 * torch.outer(e_out[0], e_in[0]), torch.outer(e_out[1], e_in[2])
+    per = torch.stack([a + b, -a + b])  # the a parts cancel in the mean
+    g_f = per.mean(0)
+    m_out, m_in = torch.einsum("eij,ekj->ik", per, per) / 2, torch.einsum("eji,ejk->ik", per, per) / 2
+    plain = R.svd_basis(g_f.float(), 0.99)
+    assert plain.rank == 1 and torch.allclose(plain.vh.abs().double(), e_in[2:3], atol=1e-5)
+    ex = R.gradient_moment_basis(g_f, m_out, m_in, rank=1)
+    assert ex.active and ex.rank == 1 and ex.total_rank == 4
+    assert torch.allclose(ex.u.abs().double(), e_out[:, 0:1], atol=1e-5)
+    assert torch.allclose(ex.vh.abs().double(), e_in[0:1], atol=1e-5)
+    assert ex.evr < 1e-6  # (e0, e0) holds none of the mean gradient
+    assert abs(R.gradient_moment_basis(g_f, m_out, m_in, rank=2).evr - 1.0) < 1e-6
+    torch.manual_seed(43)  # one gradient shared by every example: the plain basis's subspaces
+    g = torch.randn(6, 8, dtype=torch.float64)
+    same = R.gradient_moment_basis(g, g @ g.T, g.T @ g, rank=3)
+    ref = R.svd_basis(g.float(), 0.5, rank=3)
+    assert torch.allclose(same.u @ same.u.T, ref.u @ ref.u.T, atol=1e-4)
+    assert torch.allclose(same.vh.T @ same.vh, ref.vh.T @ ref.vh, atol=1e-4)
+    assert abs(same.evr - ref.evr) < 1e-5
+    assert torch.allclose(same.u.T @ same.u, torch.eye(3), atol=1e-5)
+    assert torch.allclose(same.vh @ same.vh.T, torch.eye(3), atol=1e-5)
+    assert R.gradient_moment_basis(g, g @ g.T, g.T @ g, rank=9).rank == 6  # clipped to min(out, in)
+    assert not R.gradient_moment_basis(torch.zeros(4, 5), m_out, m_in, rank=1).active
+    with pytest.raises(ValueError):
+        R.gradient_moment_basis(g_f, m_out, m_in, rank=0)
+
+
+def test_warm_start_with_gradient_moment_bases():
+    torch.manual_seed(47)
+    t = R.select_targets(Toy(), "decoder_linear")
+    w0 = {k: m.weight.detach().clone() for k, m in t.items()}
+    gr = {k: torch.randn(6, 6) for k in t}
+    src = {k: torch.randn(6, 6) for k in t}
+    per = {k: torch.randn(3, 6, 6, dtype=torch.float64) for k in t}
+    mom = {k: (torch.einsum("eij,ekj->ik", p, p) / 3, torch.einsum("eji,ejk->ik", p, p) / 3) for k, p in per.items()}
+    _, rep = R.warm_start(t, gr, 0.3, src, 0.6, gradient_moments=mom, rank_multiplier=1.0)
+    for k, m in t.items():
+        r0 = R.svd_basis(src[k], 0.6).rank
+        b = R.gradient_moment_basis(src[k], *mom[k], r0)
+        assert rep[k]["reference_rank"] == r0 and rep[k]["rank"] == r0 and abs(rep[k]["evr"] - b.evr) < 1e-6
+        proposal = (R.shrink_factors(R.row_alignment(w0[k], gr[k]), 0.3) - 1.0).unsqueeze(1) * w0[k]
+        assert torch.allclose(m.weight.detach(), w0[k] + R.project(proposal, b.u, b.vh), atol=1e-5)
+    for bad in (dict(gradient_moments=mom, component_selection="full"),  # own-spectrum ranks
+                dict(gradient_moments=mom, rank_multiplier=1.0, whitening_rho=1.0, gradient_contrast="both"),
+                dict(gradient_moments=mom, rank_multiplier=1.0, whitening=gr, whitening_rho=1.0)):
+        with pytest.raises(ValueError):
+            R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.6, **bad)
+    with pytest.raises(ValueError):  # needs a restriction
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, gradient_moments=mom, rank_multiplier=1.0)
+
+
+def test_share_rank():
+    e = torch.tensor([4.0, 3.0, 2.0, 1.0])
+    assert [R.share_rank(e, t) for t in (0.1, 0.4, 0.7, 0.71, 1.0)] == [1, 1, 2, 3, 4]
+    assert R.share_rank(torch.tensor([2.0, -1e-12, 0.0]), 1.0) <= 3  # tiny negative eigenvalues count as zero
+
+
+def test_gradient_contrast_basis_own_spectrum_ranks():
+    # The toy of test_gradient_contrast_basis_prefers_forget_only_directions, rho 0.1: lambda orders the input side
+    # e2, e0, e3 (forget energies 1, 9, 0.01) and the output side e1, e0, e2 (the same energies).
+    e_out, e_in = torch.eye(4, dtype=torch.float64), torch.eye(5, dtype=torch.float64)
+    g_f = 3.0 * torch.outer(e_out[0], e_in[0]) + 1.0 * torch.outer(e_out[1], e_in[2]) + 0.1 * torch.outer(e_out[2], e_in[3])
+    g_r = 5.0 * torch.outer(e_out[0], e_in[0]) + 0.1 * torch.outer(e_out[3], e_in[4])
+    total = 9.0 + 1.0 + 0.01
+    one = R.gradient_contrast_basis(g_f, g_r, None, 0.1, "both", energy_threshold=0.05)
+    assert one.rank == 1 and one.rank_in == 1 and abs(one.evr - 1.0 / total) < 1e-4
+    two = R.gradient_contrast_basis(g_f, g_r, None, 0.1, "both", energy_threshold=0.5)
+    assert two.rank == 2 and two.rank_in == 2 and abs(two.evr - 10.0 / total) < 1e-4
+    assert torch.allclose((two.vh.T @ two.vh).diagonal().double(), e_in[0] + e_in[2], atol=1e-4)
+    inp = R.gradient_contrast_basis(g_f, g_r, None, 0.1, "input", energy_threshold=0.5)  # output side: plain EVR
+    assert inp.rank == R.svd_basis(g_f.float(), 0.5).rank == 1 and inp.rank_in == 2 and abs(inp.evr - 9.0 / total) < 1e-4
+    assert inp.u.shape == (4, 1) and inp.vh.shape == (2, 5)
+    assert R.gradient_contrast_basis(g_f, g_r, 2, 0.1, "both").rank_in is None  # an explicit budget: one rank
+    for bad in (dict(rank=None), dict(rank=2, energy_threshold=0.5), dict(rank=None, energy_threshold=0.0)):
+        with pytest.raises(ValueError):
+            R.gradient_contrast_basis(g_f, g_r, rho=0.1, sides="both", **bad)
+
+
+def test_gradient_moment_basis_own_spectrum_ranks():
+    e_out, e_in = torch.eye(4, dtype=torch.float64), torch.eye(5, dtype=torch.float64)
+    a, b = 3.0 * torch.outer(e_out[0], e_in[0]), torch.outer(e_out[1], e_in[2])
+    per = torch.stack([a + b, -a + b])
+    m_out, m_in = torch.einsum("eij,ekj->ik", per, per) / 2, torch.einsum("eji,ejk->ik", per, per) / 2
+    one = R.gradient_moment_basis(per.mean(0), m_out, m_in, energy_threshold=0.5)  # spectra 9, 1 on both sides
+    assert one.rank == 1 and one.rank_in == 1 and one.evr < 1e-6
+    two = R.gradient_moment_basis(per.mean(0), m_out, m_in, energy_threshold=0.95)
+    assert two.rank == 2 and two.rank_in == 2 and abs(two.evr - 1.0) < 1e-6
+    torch.manual_seed(53)  # a wide weight: the input side's own rank may exceed min(out, in)
+    per = torch.randn(8, 2, 6, dtype=torch.float64)
+    m_out, m_in = torch.einsum("eij,ekj->ik", per, per) / 8, torch.einsum("eji,ejk->ik", per, per) / 8
+    wide = R.gradient_moment_basis(per.mean(0), m_out, m_in, energy_threshold=0.999)
+    want_in = R.share_rank(torch.linalg.eigvalsh(m_in).flip(0), 0.999)
+    assert wide.total_rank == 2 and wide.rank <= 2 and wide.rank_in == want_in > 2
+    assert wide.u.shape == (2, wide.rank) and wide.vh.shape == (want_in, 6)
+    assert torch.allclose(wide.vh @ wide.vh.T, torch.eye(want_in), atol=1e-5)
+    with pytest.raises(ValueError):
+        R.gradient_moment_basis(per.mean(0), m_out, m_in)  # neither rank nor threshold
+
+
+def test_warm_start_with_own_spectrum_ranks():
+    torch.manual_seed(59)
+    gr = {k: torch.randn(6, 6) for k in R.select_targets(Toy(), "decoder_linear")}
+    src = {k: torch.randn(6, 6) for k in gr}
+    per = {k: torch.randn(3, 6, 6, dtype=torch.float64) for k in gr}
+    mom = {k: (torch.einsum("eij,ekj->ik", p, p) / 3, torch.einsum("eji,ejk->ik", p, p) / 3) for k, p in per.items()}
+    for kwargs, build in (
+            (dict(gradient_moments=mom), lambda k: R.gradient_moment_basis(src[k], *mom[k], energy_threshold=0.6)),
+            (dict(gradient_contrast="both", whitening_rho=1.0),
+             lambda k: R.gradient_contrast_basis(src[k], gr[k], None, 1.0, "both", energy_threshold=0.6)),
+            (dict(gradient_contrast="both", whitening_rho=1.0, contrast_rank_rule="kept_energy"),
+             lambda k: R.gradient_contrast_basis(src[k], gr[k], None, 1.0, "both", kept_threshold=0.6))):
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: m.weight.detach().clone() for k, m in t.items()}
+        _, rep = R.warm_start(t, gr, 0.3, src, 0.6, **kwargs)
+        for k, m in t.items():
+            b = build(k)
+            assert rep[k]["rank"] == b.rank and rep[k].get("rank_in") == b.rank_in and "reference_rank" not in rep[k]
+            proposal = (R.shrink_factors(R.row_alignment(w0[k], gr[k]), 0.3) - 1.0).unsqueeze(1) * w0[k]
+            assert torch.allclose(m.weight.detach(), w0[k] + R.project(proposal, b.u, b.vh), atol=1e-5)
+    for bad in (dict(gradient_contrast="both", whitening_rho=1.0, contrast_rank_rule="kept_energy", rank_multiplier=1.0),
+                dict(gradient_moments=mom, contrast_rank_rule="kept_energy"),
+                dict(gradient_contrast="both", whitening_rho=1.0, contrast_rank_rule="lambda")):
+        with pytest.raises(ValueError):
+            R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.6, **bad)
+
+
+def test_gradient_contrast_basis_kept_energy_rank():
+    # The diagonal toy at rho 0.1 (lambda order: output e1, e0, e2; input e2, e0, e3): kept(r) = 1 / 10.01 at r = 1,
+    # (1 + 9) / 10.01 at r = 2 and 1 at r = 3 (G_f[2, 3] = 0.1 joins).
+    e_out, e_in = torch.eye(4, dtype=torch.float64), torch.eye(5, dtype=torch.float64)
+    g_f = 3.0 * torch.outer(e_out[0], e_in[0]) + 1.0 * torch.outer(e_out[1], e_in[2]) + 0.1 * torch.outer(e_out[2], e_in[3])
+    g_r = 5.0 * torch.outer(e_out[0], e_in[0]) + 0.1 * torch.outer(e_out[3], e_in[4])
+    total = 9.0 + 1.0 + 0.01
+    for threshold, rank, kept in ((0.05, 1, 1.0 / total), (0.5, 2, 10.0 / total), (0.9995, 3, 1.0)):
+        b = R.gradient_contrast_basis(g_f, g_r, None, 0.1, "both", kept_threshold=threshold)
+        assert b.rank == rank and b.rank_in is None and abs(b.evr - kept) < 1e-4
+        assert b.u.shape == (4, rank) and b.vh.shape == (rank, 5)
+    plain_like = R.gradient_contrast_basis(g_f, g_r, None, 0.1, "input", kept_threshold=0.5)  # u: e0, then e1
+    assert plain_like.rank == 2 and abs(plain_like.evr - 10.0 / total) < 1e-4
+    for bad in (dict(rank=2, kept_threshold=0.5), dict(energy_threshold=0.5, kept_threshold=0.5),
+                dict(kept_threshold=1.5)):
+        with pytest.raises(ValueError):
+            R.gradient_contrast_basis(g_f, g_r, **{"rank": None, "rho": 0.1, "sides": "both", **bad})
+
+
 def test_combined_bases_reduce_to_c_and_d():
     gen = torch.Generator().manual_seed(19)
     g = torch.randn(5, 3, generator=gen) @ torch.randn(3, 6, generator=gen)
@@ -824,9 +1076,560 @@ def test_scale_update_is_linear_from_init():
         assert abs(float((R.scale_update(w0, ws, t) - w0).norm()) - t * float((ws - w0).norm())) < 1e-5
 
 
-def test_parse_type_scales():
-    assert R.parse_type_scales("down_proj=1,up_proj=0.714286, o_proj=0.5") == {
-        "down_proj": 1.0, "up_proj": 0.714286, "o_proj": 0.5}
+def test_parse_type_values():
+    assert R.parse_type_values("down_proj=0.2,up_proj=0.5, o_proj=0.5") == {
+        "down_proj": 0.2, "up_proj": 0.5, "o_proj": 0.5}
     for bad in ("down_proj", "down_proj=1,down_proj=2", "=1", "down_proj=x"):
         with pytest.raises(ValueError):
-            R.parse_type_scales(bad)
+            R.parse_type_values(bad)
+
+
+def test_warm_start_per_type_floors():
+    """Rows anti-aligned with -G_r (G_r = W) sit at the floor, so each type is scaled by exactly its own floor;
+    equal per-type floors reproduce the single floor, also in the restricted (projected) warm start."""
+    torch.manual_seed(61)
+    floors = {"q_proj": 0.1, "k_proj": 0.2, "v_proj": 0.3, "o_proj": 0.4, "gate_proj": 0.5, "up_proj": 0.6,
+              "down_proj": 0.7}
+    m = Toy()
+    t = R.select_targets(m, "decoder_linear")
+    before = {k: v.weight.detach().clone() for k, v in t.items()}
+    R.warm_start(t, {k: w.clone() for k, w in before.items()}, floors)
+    for k, v in t.items():
+        assert torch.allclose(v.weight, floors[k.rsplit(".", 1)[-1]] * before[k], atol=1e-6)
+    with pytest.raises(ValueError):
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), {k: w.clone() for k, w in before.items()},
+                     {"q_proj": 0.3})
+    results = []
+    for s_min in (0.3, {k: 0.3 for k in floors}):
+        torch.manual_seed(62)
+        m = Toy()
+        t = R.select_targets(m, "decoder_linear")
+        gr = {k: v.weight.detach().clone() for k, v in t.items()}
+        gf = {k: torch.randn_like(v.weight) for k, v in t.items()}
+        R.warm_start(t, gr, s_min, gf, 0.97)
+        results.append({k: v.weight.detach().clone() for k, v in t.items()})
+    assert all(torch.equal(results[0][k], results[1][k]) for k in results[0])
+
+
+def _restricted_floor_case(floor, seed=71):
+    """Restricted warm start of the toy with G_r = W (every row anti-aligned, so at the floor) and a fixed random
+    forget gradient: the same bases for every floor. Returns the deltas, the report and the restrictions."""
+    torch.manual_seed(seed)
+    t = R.select_targets(Toy(), "decoder_linear")
+    w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+    gf = {k: torch.randn_like(w) for k, w in w0.items()}
+    restr, rep = R.warm_start(t, {k: w.clone() for k, w in w0.items()}, floor, gf, 0.9)
+    return {k: v.weight.detach() - w0[k] for k, v in t.items()}, rep, restr
+
+
+def test_floor_equals_scaled_update_for_rows_at_the_floor():
+    """Stage 1: with every row at the floor the update at floor 1 - t (1 - s) is t times the update at floor s, so
+    W + t Delta W^D is a floor (t = 1 / (1 - s) is floor 0); the report gives applied_norm = (1 - s) ||P(W)||."""
+    base, rep, _ = _restricted_floor_case(0.3)
+    for t in (0.5, 1.2):
+        scaled, _, _ = _restricted_floor_case(1.0 - t * 0.7)
+        for k in base:
+            assert torch.allclose(scaled[k], t * base[k], atol=1e-5)
+    zero, _, _ = _restricted_floor_case(0.0)
+    for k in base:
+        assert torch.allclose(zero[k], base[k] / 0.7, atol=1e-5)
+    for r in rep.values():
+        assert r["shrink_at_floor"] == 1.0
+        assert abs(r["applied_norm"] - 0.7 * r["projected_weight_norm"]) < 1e-5
+
+
+def test_update_budget_and_uniform_matched_floor():
+    """Stage 1.4: B(s)^2 = sum_k (1 - s_k)^2 E_k is the squared norm of the whole update; the uniform floor of the same
+    budget gives an update of that norm; a budget above sqrt(sum E_k) needs s < 0 and is infeasible."""
+    floors = {"q_proj": 0.1, "down_proj": 0.6}
+    delta, rep, _ = _restricted_floor_case(floors)
+    energies = {}
+    for name, r in rep.items():
+        kind = name.rsplit(".", 1)[-1]
+        energies[kind] = energies.get(kind, 0.0) + r["projected_weight_norm"] ** 2
+    norm = lambda d: math.sqrt(sum(float(x.square().sum()) for x in d.values()))  # noqa: E731
+    b = R.update_budget(floors, energies)
+    assert abs(b - norm(delta)) < 1e-5 * max(1.0, b)
+    s_u = R.uniform_floor_for_budget(b, energies)
+    assert s_u is not None and 0.1 < s_u < 0.6
+    matched, _, _ = _restricted_floor_case(s_u)
+    assert abs(norm(matched) - b) < 1e-5 * max(1.0, b)
+    assert abs(R.uniform_floor_for_budget(math.sqrt(sum(energies.values())), energies)) < 1e-12
+    assert R.uniform_floor_for_budget(1.01 * math.sqrt(sum(energies.values())), energies) is None
+    with pytest.raises(ValueError):
+        R.update_budget({"q_proj": 0.1}, energies)
+
+
+def test_shrink_score_rules_in_warm_start():
+    """Stage 2: the default rule reproduces the baseline bit for bit; every other rule applies P((S - I) W) with S from
+    recast_scores at the same floor and basis; the diagnostics report every rule; the rules exclude other changes."""
+    import recast_scores as RS
+    runs = {}
+    for rule, diag in (("baseline", False), ("original", True)) + tuple((r, False) for r in RS.RULES[1:]):
+        torch.manual_seed(81)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        gr = {k: torch.randn_like(w) for k, w in w0.items()}
+        gf = {k: torch.randn_like(w) for k, w in w0.items()}
+        kw = {} if rule == "baseline" else {"shrink_score": rule, "score_diagnostics": diag}
+        restr, rep = R.warm_start(t, gr, 0.05, gf, 0.9, **kw)
+        runs[rule] = ({k: v.weight.detach() - w0[k] for k, v in t.items()}, restr, rep, w0, gr)
+    for k in runs["baseline"][0]:
+        assert torch.equal(runs["original"][0][k], runs["baseline"][0][k])
+    for rule in RS.RULES[1:]:
+        delta, restr, rep, w0, gr = runs[rule]
+        for k in delta:
+            b = restr[k].basis
+            s = RS.row_factors(RS.shrink_scores(w0[k], gr[k], b.u, b.vh), rule, 0.05).float()
+            expect = R.project((s - 1.0).unsqueeze(1) * w0[k], b.u, b.vh)
+            assert torch.allclose(delta[k], expect, atol=1e-6)
+            assert rep[k]["shrink_score"] == rule
+    rep = runs["original"][2]
+    for k, r in rep.items():
+        assert set(r["scores"]) >= {"original", "projected_row", "projected_sensitivity", "global_projected"}
+        assert abs(r["applied_first_order"]["update_norm"] - r["applied_norm"]) < 1e-5
+        assert set(r["update_norm_by_floor"]) == set(RS.RULES)
+    with pytest.raises(ValueError):
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), runs["baseline"][4], 0.05, shrink_score="projected_row")
+    with pytest.raises(ValueError):
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), runs["baseline"][4], 0.05, gf, 0.9,
+                     shrink_score="cosine")
+
+
+def test_core_diagnostics_in_warm_start():
+    """Stage 3: with every row at the floor the applied S is uniform, so the update core is (s - 1) K (cosines 1, no
+    off-diagonal energy, beta = 1 - s); the random control S moves the leading subspaces; no update changes."""
+    deltas = {}
+    for diag in (False, True):
+        torch.manual_seed(91)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        gf = {k: torch.randn_like(w) for k, w in w0.items()}
+        _, rep = R.warm_start(t, {k: w.clone() for k, w in w0.items()}, 0.3, gf, 0.9, core_diagnostics=diag)
+        deltas[diag] = {k: v.weight.detach() - w0[k] for k, v in t.items()}
+    for k in deltas[False]:
+        assert torch.equal(deltas[False][k], deltas[True][k])
+    for k, r in rep.items():
+        applied = r["cores"]["applied"]
+        assert applied["beta"]["offdiag_energy_fraction"] < 1e-12
+        assert abs(applied["beta"]["mean"] - 0.7) < 1e-6 and abs(applied["beta"]["min"] - 0.7) < 1e-6
+        for a in applied["angles"].values():
+            assert a["left_min_cos"] > 1 - 1e-6 and a["right_min_cos"] > 1 - 1e-6
+        assert r["cores"]["control_uniform_random"]["beta"]["offdiag_energy_fraction"] > 1e-6
+        assert set(r["cores"]) == {"applied", "control_uniform_random", "original", "projected_row",
+                                   "projected_sensitivity", "global_projected"}
+
+
+def test_weight_contraction_in_warm_start():
+    """Weight-component contraction on basis D: the update is -sum beta_j E_j with beta from recast_contraction at the
+    budget 1 - floor (random drawn per seed and target), so it moves each target by (1 - floor) ||P(W)||; the component
+    diagnostics change nothing; the contraction needs a representation basis and a reachable budget."""
+    import zlib
+    import recast_bases as RB
+    import recast_contraction as RC
+    gen = torch.Generator().manual_seed(40)
+    gr = {f"model.layers.{i}.{p}": torch.randn(6, 6, generator=gen) for i in range(2) for p in ("q_proj", "down_proj")}
+    src = {k: torch.randn(6, 6, generator=gen) for k in gr}
+    xs = {k: torch.randn(50, 6, generator=gen) for k in gr}
+    cov_f = {k: x.T @ x / 50 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(6, generator=gen) + 0.1) for k in gr}
+    extra = dict(whitening_rho=1.0, representation_output="gradient", forget_covariances=cov_f,
+                 retain_covariances=cov_r, rank_multiplier=1.25)
+    runs = {}
+    for label, kw in (("top", dict(weight_contraction="top", contraction_strength=1.0)),
+                      ("top_diag", dict(weight_contraction="top", contraction_strength=1.0, contraction_diagnostics=True)),
+                      ("random", dict(weight_contraction="random", contraction_strength=1.0, component_seed=3)),
+                      ("residual", dict(weight_contraction="top", contraction_strength=1.0, contraction_residual=1e-3))):
+        torch.manual_seed(41)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        restr, rep = R.warm_start(t, gr, 0.3, src, 0.9, **extra, **kw)
+        runs[label] = ({k: v.weight.detach() - w0[k] for k, v in t.items()}, restr, rep, w0)
+    for label, mode, seed, residual in (("top", "top", 0, 0.0), ("random", "random", 3, 0.0), ("residual", "top", 0, 1e-3)):
+        delta, restr, rep, w0 = runs[label]
+        for k in delta:
+            b = restr[k].basis
+            if not b.active:
+                continue
+            comps = RB.weight_components(w0[k].float(), b.u, b.vh)
+            g = torch.Generator().manual_seed(seed * 1000003 + zlib.crc32(k.encode()))
+            beta = RC.contraction_beta(comps["kappa"], mode, 0.7, 1.0, g, residual=residual)
+            assert torch.allclose(delta[k], RC.contraction_delta(comps, beta).float(), atol=1e-5)
+            pw = float(R.project(w0[k], b.u, b.vh).norm())
+            assert abs(float(delta[k].norm()) - 0.7 * pw) < 1e-4 * max(1.0, pw)
+            assert rep[k]["contraction"]["mode"] == mode and abs(rep[k]["contraction"]["energy_fraction"] - 0.49) < 1e-6
+    for k in runs["top"][0]:
+        assert torch.equal(runs["top"][0][k], runs["top_diag"][0][k])
+        prof = runs["top_diag"][2][k].get("contraction_components")
+        if prof is not None:
+            n = len(prof["kappa"])
+            assert len(prof["input_contrast"]) == n == len(prof["alignment"]["forget"]) == len(prof["alignment"]["retain"])
+    assert any("contraction_components" in r for r in runs["top_diag"][2].values())
+    with pytest.raises(ValueError):                                       # no representation basis
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.9, weight_contraction="top")
+    with pytest.raises(ValueError):                                       # budget 0.7 above the strength 0.5
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.9, **extra, weight_contraction="top",
+                     contraction_strength=0.5)
+    with pytest.raises(ValueError):                                       # a residual without a contraction
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.9, **extra, contraction_residual=1e-3)
+    torch.manual_seed(41)                                                 # forget_retain: the score from the same G_f, G_r
+    t = R.select_targets(Toy(), "decoder_linear")
+    w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+    restr, _ = R.warm_start(t, gr, 0.3, src, 0.9, **extra, weight_contraction="forget_retain", contraction_strength=1.0)
+    for k, v in t.items():
+        b = restr[k].basis
+        if not b.active:
+            continue
+        comps = RB.weight_components(w0[k].float(), b.u, b.vh)
+        beta = RC.contraction_beta(comps["kappa"], "forget_retain", 0.7, 1.0,
+                                   score=RC.forget_retain_score(comps, src[k], gr[k]))
+        assert torch.allclose(v.weight.detach() - w0[k], RC.contraction_delta(comps, beta).float(), atol=1e-5)
+
+
+def test_output_diagnostics_in_warm_start():
+    """The output report of the applied update matches tr(M C M^T) on the input covariances, every SVD ordering is
+    simulated at the ReCAST displacement, and the diagnostics change no update."""
+    import recast_output_contrast as RO
+    gen = torch.Generator().manual_seed(50)
+    gr = {f"model.layers.{i}.{p}": torch.randn(6, 6, generator=gen) for i in range(2) for p in ("q_proj", "down_proj")}
+    src = {k: torch.randn(6, 6, generator=gen) for k in gr}
+    xs = {k: torch.randn(50, 6, generator=gen) for k in gr}
+    cov_f = {k: x.T @ x / 50 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(6, generator=gen) + 0.1) for k in gr}
+    extra = dict(whitening_rho=1.0, representation_output="gradient", forget_covariances=cov_f,
+                 retain_covariances=cov_r, rank_multiplier=1.25)
+    runs = {}
+    for diag in (False, True):
+        torch.manual_seed(51)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        _, rep = R.warm_start(t, gr, 0.3, src, 0.9, **extra, output_diagnostics=diag, contraction_diagnostics=diag)
+        runs[diag] = ({k: v.weight.detach() - w0[k] for k, v in t.items()}, rep, w0)
+    for k in runs[False][0]:
+        assert torch.equal(runs[False][0][k], runs[True][0][k])
+        r, w = runs[True][1][k], runs[True][2][k]
+        if "output_energy" not in r:
+            continue
+        d = runs[True][0][k]
+        expect = RO.output_energy(d, cov_f[k]) / RO.output_energy(w, cov_f[k])
+        assert abs(r["output_energy"]["forget_removed_share"] - expect) < 1e-6 * max(1.0, expect)
+        assert set(r["output_energy_svd"]) == set(R.CONTRACTION_MODES)
+        if k.endswith("down_proj"):
+            assert set(r["output_contrast"]) == {f"{rho:g}" for rho in R.OUTPUT_CONTRAST_RHOS}
+    assert any("output_energy" in r for r in runs[True][1].values())
+
+
+def test_write_divisors_match_scaling_the_residual_stream():
+    """h <- c h + write_k at write k is the stream before write k times c (the embedding and every earlier write times c)
+    or, equivalently, write k and every later write divided by c: every read is an RMSNorm, so the logits agree;
+    residual_write_divisors / apply_write_divisors give the second form."""
+    import copy
+    transformers = pytest.importorskip("transformers")
+    cfg = transformers.LlamaConfig(vocab_size=37, hidden_size=16, intermediate_size=32, num_hidden_layers=3,
+                                   num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-12,
+                                   tie_word_embeddings=False, max_position_embeddings=32)
+    torch.manual_seed(0)
+    base = transformers.LlamaForCausalLM(cfg).eval()
+    ids = torch.randint(0, 37, (2, 7))
+    names = list(R.residual_write_divisors(3, {}))
+    assert names[:2] == ["model.layers.0.self_attn.o_proj", "model.layers.0.mlp.down_proj"] and len(names) == 6
+    k_name, c = "model.layers.1.self_attn.o_proj", 0.4
+    a, b = copy.deepcopy(base), copy.deepcopy(base)
+    with torch.no_grad():
+        a.model.embed_tokens.weight.mul_(c)
+        mods = dict(a.named_modules())
+        for n in names[:names.index(k_name)]:
+            mods[n].weight.mul_(c)
+    div = R.residual_write_divisors(3, {k_name: c, "model.layers.2.mlp.down_proj": 1.0})
+    assert [div[n] for n in names] == [1.0, 1.0, c, c, c, c]
+    R.apply_write_divisors(b, div)
+    with torch.no_grad():
+        la, lb, l0 = a(ids).logits, b(ids).logits, base(ids).logits
+    assert torch.allclose(la, lb, rtol=1e-4, atol=1e-5)
+    assert not torch.allclose(la, l0, atol=1e-4)                          # it does change the function
+
+
+def test_output_contrast_in_warm_start():
+    """output_contrast_rho replaces each target's update by the output-contrast contraction with the displacement of
+    the ReCAST update it replaces; it excludes a weight contraction."""
+    import recast_output_contrast as RO
+    gen = torch.Generator().manual_seed(52)
+    gr = {f"model.layers.{i}.{p}": torch.randn(6, 6, generator=gen) for i in range(2) for p in ("q_proj", "down_proj")}
+    src = {k: torch.randn(6, 6, generator=gen) for k in gr}
+    xs = {k: torch.randn(50, 6, generator=gen) for k in gr}
+    cov_f = {k: x.T @ x / 50 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(6, generator=gen) + 0.1) for k in gr}
+    extra = dict(whitening_rho=1.0, representation_output="gradient", forget_covariances=cov_f,
+                 retain_covariances=cov_r, rank_multiplier=1.25)
+    runs = {}
+    for rho in (None, 0.1):
+        torch.manual_seed(53)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        _, rep = R.warm_start(t, gr, 0.3, src, 0.9, **extra, output_contrast_rho=rho)
+        runs[rho] = ({k: v.weight.detach() - w0[k] for k, v in t.items()}, rep, w0)
+    seen = 0
+    for k, d in runs[0.1][0].items():
+        r = runs[0.1][1][k]
+        if "output_contrast_applied" not in r:
+            continue
+        seen += 1
+        recast_norm = float(runs[None][0][k].norm())
+        assert abs(r["output_contrast_applied"]["recast_update_norm"] - recast_norm) < 1e-4 * max(1.0, recast_norm)
+        expect = RO.output_contrast_contraction(runs[0.1][2][k], cov_f[k], cov_r[k], 0.1,
+                                                r["output_contrast_applied"]["recast_update_norm"])[0]
+        assert torch.allclose(d, expect.float(), atol=1e-5)
+        assert abs(float(d.norm()) - recast_norm) < 1e-4 * max(1.0, recast_norm)
+    assert seen > 0
+    with pytest.raises(ValueError):
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.9, **extra, output_contrast_rho=0.1,
+                     weight_contraction="top")
+
+
+def test_family_diagnostics_in_warm_start():
+    """Every family reaches the applied update's forget output share on down_proj and reports its retain share; the
+    diagnostics change no update."""
+    gen = torch.Generator().manual_seed(60)
+    gr = {f"model.layers.{i}.{p}": torch.randn(6, 6, generator=gen) for i in range(2) for p in ("q_proj", "down_proj")}
+    src = {k: torch.randn(6, 6, generator=gen) for k in gr}
+    xs = {k: torch.randn(50, 6, generator=gen) for k in gr}
+    cov_f = {k: x.T @ x / 50 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(6, generator=gen) + 0.1) for k in gr}
+    extra = dict(whitening_rho=1.0, representation_output="gradient", forget_covariances=cov_f,
+                 retain_covariances=cov_r, rank_multiplier=1.25)
+    runs = {}
+    for diag in (False, True):
+        torch.manual_seed(61)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        _, rep = R.warm_start(t, gr, 0.3, src, 0.9, **extra, family_diagnostics=diag)
+        runs[diag] = ({k: v.weight.detach() - w0[k] for k, v in t.items()}, rep)
+    seen = 0
+    for k in runs[False][0]:
+        assert torch.equal(runs[False][0][k], runs[True][0][k])
+        fam = runs[True][1][k].get("families")
+        if fam is None:
+            continue
+        seen += 1
+        for name in ("output_contrast", "gradient_contrast", "input_contrast"):
+            for rho in (f"{x:g}" for x in R.FAMILY_RHOS):
+                assert abs(fam[name][rho]["forget_share"] - fam["recast_forget_share"]) < 1e-6
+                assert fam[name][rho]["retain_share"] >= 0.0    # the input family can exceed 1 (P C P is not <= C)
+    assert seen > 0
+
+
+def test_family_contraction_in_warm_start():
+    """family_contraction replaces each update by the family's removal of the ReCAST update's forget output share."""
+    import recast_direction_families as RF
+    import recast_output_contrast as RO
+    gen = torch.Generator().manual_seed(70)
+    gr = {f"model.layers.{i}.{p}": torch.randn(6, 6, generator=gen) for i in range(2) for p in ("q_proj", "down_proj")}
+    src = {k: torch.randn(6, 6, generator=gen) for k in gr}
+    xs = {k: torch.randn(50, 6, generator=gen) for k in gr}
+    cov_f = {k: x.T @ x / 50 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(6, generator=gen) + 0.1) for k in gr}
+    extra = dict(whitening_rho=1.0, representation_output="gradient", forget_covariances=cov_f,
+                 retain_covariances=cov_r, rank_multiplier=1.25)
+    runs = {}
+    for fam in (None, "input_contrast", "output_contrast"):
+        torch.manual_seed(71)
+        t = R.select_targets(Toy(), "decoder_linear")
+        w0 = {k: v.weight.detach().clone() for k, v in t.items()}
+        kw = {} if fam is None else dict(family_contraction=fam, family_rho=1.0)
+        _, rep = R.warm_start(t, gr, 0.3, src, 0.9, **extra, **kw)
+        runs[fam] = ({k: v.weight.detach() - w0[k] for k, v in t.items()}, rep, w0)
+    for fam in ("input_contrast", "output_contrast"):
+        seen = 0
+        for k, d in runs[fam][0].items():
+            r = runs[fam][1][k].get("family_contraction")
+            if r is None:
+                continue
+            seen += 1
+            share = RO.output_energy_report(runs[None][2][k], runs[None][0][k], cov_f[k], cov_r[k])["forget_removed_share"]
+            assert abs(r["recast_forget_share"] - share) < 1e-5
+            expect, _ = RF.family_contraction_delta(runs[fam][2][k], cov_f[k], cov_r[k], fam, 1.0, r["recast_forget_share"])
+            assert torch.allclose(d, expect.float(), atol=1e-5)
+        assert seen > 0
+    with pytest.raises(ValueError):
+        R.warm_start(R.select_targets(Toy(), "decoder_linear"), gr, 0.3, src, 0.9, **extra,
+                     family_contraction="input_contrast")                 # no ridge
+
+
+def test_output_only_basis_restricts_only_the_output_side():
+    """output_only: Vh = I, U from the output-covariance contrast (as the representation side), so P(D) = U U^T D."""
+    gen = torch.Generator().manual_seed(80)
+    w = torch.randn(5, 7, generator=gen)
+    g = torch.randn(5, 7, generator=gen)
+    xf, xr = torch.randn(60, 7, generator=gen), torch.randn(60, 7, generator=gen)
+    cf, cr = xf.T @ xf / 60, xr.T @ xr / 60
+    b = R.representation_basis(g, cf, cr, w, rank=3, rho=1.0, output_side="output_only")
+    rep = R.representation_basis(g, cf, cr, w, rank=3, rho=1.0, output_side="representation")
+    assert b.active and torch.equal(b.vh, torch.eye(7)) and b.u.shape == (5, 3)
+    assert torch.allclose(b.u, rep.u, atol=1e-6)                          # the same output-side contrast
+    d = torch.randn(5, 7, generator=gen)
+    assert torch.allclose(R.project(d, b.u, b.vh), b.u @ (b.u.T @ d), atol=1e-6)
+
+
+def _write_targets(seed):
+    """down_proj (6 x 9) and o_proj (6 x 6) of two blocks, with gradients and input covariances."""
+    torch.manual_seed(seed)
+    t = {}
+    for i in range(2):
+        t[f"model.layers.{i}.self_attn.o_proj"] = nn.Linear(6, 6, bias=False)
+        t[f"model.layers.{i}.mlp.down_proj"] = nn.Linear(9, 6, bias=False)
+    gen = torch.Generator().manual_seed(seed + 1)
+    gr = {k: torch.randn(m.weight.shape, generator=gen) for k, m in t.items()}
+    src = {k: torch.randn(m.weight.shape, generator=gen) for k, m in t.items()}
+    xs = {k: torch.randn(60, m.weight.shape[1], generator=gen) for k, m in t.items()}
+    cov_f = {k: x.T @ x / 60 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(m.weight.shape[1], generator=gen) + 0.1) for k, m in t.items()}
+    return t, gr, src, cov_f, cov_r
+
+
+def test_global_family_in_warm_start():
+    """global_family removes, over all targets together, the forget output energy the ReCAST updates remove, with the
+    deltas of recast_global_families; score and random orders differ; other targets or a missing ridge are refused."""
+    import recast_global_families as RG
+    import recast_output_contrast as RO
+    extra = dict(whitening_rho=1.0, representation_output="gradient", rank_multiplier=1.0)
+    t, gr, src, cov_f, cov_r = _write_targets(90)
+    w0 = {k: m.weight.detach().clone() for k, m in t.items()}
+    _, ref = R.warm_start(t, gr, 0.1, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r)
+    recast = sum(RO.output_energy(t[k].weight.detach() - w0[k], cov_f[k]) for k in t)
+    for family in RG.FAMILIES:
+        applied = {}
+        for order in ("score", "random"):
+            t, gr, src, cov_f, cov_r = _write_targets(90)
+            _, rep = R.warm_start(t, gr, 0.1, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r,
+                                  global_family=family, global_family_rho=0.5, global_family_floor=0.4,
+                                  global_family_order=order, component_seed=3)
+            deltas = {k: t[k].weight.detach() - w0[k] for k in t}
+            g = rep[next(iter(t))]["global_family"]["global"]
+            assert abs(g["budget"] - recast) < 1e-4 * recast and g["reached"]
+            assert abs(sum(RO.output_energy(d, cov_f[k]) for k, d in deltas.items()) - recast) < 1e-4 * recast
+            for k, d in deltas.items():
+                r = rep[k]["global_family"]
+                gen = (torch.Generator().manual_seed(3 * 1000003 + R.zlib.crc32(k.encode())) if order == "random"
+                       else None)
+                part = RG.target_directions(w0[k].float(), cov_f[k], cov_r[k], src[k], gr[k], family, 0.5,
+                                            keys_generator=gen)
+                expect = RG.global_delta(part, w0[k].float(), r["directions"], 0.6, r["beta_last"])
+                assert torch.allclose(d, expect.float(), atol=1e-5)
+            applied[order] = deltas
+        assert any(not torch.allclose(applied["score"][k], applied["random"][k]) for k in t)
+    for family in RG.FAMILIES:                                                                  # energy_ratio order
+        t, gr, src, cov_f, cov_r = _write_targets(90)
+        _, rep = R.warm_start(t, gr, 0.1, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r,
+                              global_family=family, global_family_rho=0.5, global_family_floor=0.04,
+                              global_family_order="energy_ratio", global_family_alpha=0.5)
+        assert abs(sum(RO.output_energy(t[k].weight.detach() - w0[k], cov_f[k]) for k in t) - recast) < 1e-4 * recast
+        for k in t:
+            r = rep[k]["global_family"]
+            part = RG.target_directions(w0[k].float(), cov_f[k], cov_r[k], src[k], gr[k], family, 0.5, key_alpha=0.5)
+            expect = RG.global_delta(part, w0[k].float(), r["directions"], 0.96, r["beta_last"])
+            assert torch.allclose(t[k].weight.detach() - w0[k], expect.float(), atol=1e-5)
+        assert rep[k]["global_family"]["global"]["alpha"] == 0.5
+    t, gr, src, cov_f, cov_r = _write_targets(90)
+    with pytest.raises(ValueError):
+        R.warm_start(t, gr, 0.1, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r,
+                     global_family="input_contrast", global_family_floor=0.4)                  # no ridge
+    with pytest.raises(ValueError):
+        R.warm_start(t, gr, 0.1, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r,
+                     global_family="output_contrast", global_family_rho=0.5, global_family_floor=0.4,
+                     global_family_order="energy_ratio")                                       # no alpha
+    q = R.select_targets(Toy(), "decoder_linear")                                              # q_proj targets
+    gq = {k: torch.randn(m.weight.shape) for k, m in q.items()}
+    cq = {k: torch.eye(m.weight.shape[1]) for k, m in q.items()}
+    with pytest.raises(ValueError):
+        R.warm_start(q, gq, 0.1, gq, 0.9, **extra, forget_covariances=cq, retain_covariances=cq,
+                     global_family="output_contrast", global_family_rho=0.5, global_family_floor=0.4)
+
+
+def test_global_family_share_unit_admits_other_types():
+    """With the share budget unit up_proj and v_proj targets join down_proj and o_proj; the summed shares of their removed
+    forget output energy equal the summed shares of the ReCAST updates. The energy unit still refuses them."""
+    import recast_output_contrast as RO
+    torch.manual_seed(95)
+    def make():
+        torch.manual_seed(95)
+        t = {}
+        for i in range(2):
+            t[f"model.layers.{i}.self_attn.v_proj"] = nn.Linear(6, 3, bias=False)
+            t[f"model.layers.{i}.self_attn.o_proj"] = nn.Linear(6, 6, bias=False)
+            t[f"model.layers.{i}.mlp.up_proj"] = nn.Linear(6, 9, bias=False)
+            t[f"model.layers.{i}.mlp.down_proj"] = nn.Linear(9, 6, bias=False)
+        return t
+    t = make()
+    gen = torch.Generator().manual_seed(96)
+    gr = {k: torch.randn(m.weight.shape, generator=gen) for k, m in t.items()}
+    src = {k: torch.randn(m.weight.shape, generator=gen) for k, m in t.items()}
+    xs = {k: torch.randn(60, m.weight.shape[1], generator=gen) for k, m in t.items()}
+    cov_f = {k: x.T @ x / 60 for k, x in xs.items()}
+    cov_r = {k: torch.diag(torch.rand(m.weight.shape[1], generator=gen) + 0.1) for k, m in t.items()}
+    extra = dict(whitening_rho=1.0, representation_output="gradient", rank_multiplier=1.0, forget_covariances=cov_f,
+                 retain_covariances=cov_r)
+    w0 = {k: m.weight.detach().clone() for k, m in t.items()}
+    R.warm_start(t, gr, 0.2, src, 0.9, **extra)
+    recast = sum(RO.output_energy(t[k].weight.detach() - w0[k], cov_f[k]) / RO.output_energy(w0[k], cov_f[k]) for k in t)
+    t = make()
+    _, rep = R.warm_start(t, gr, 0.2, src, 0.9, **extra, global_family="input_contrast", global_family_rho=1.0,
+                          global_family_floor=0.04, global_family_budget_unit="share")
+    got = sum(RO.output_energy(t[k].weight.detach() - w0[k], cov_f[k]) / RO.output_energy(w0[k], cov_f[k]) for k in t)
+    g = rep[next(iter(t))]["global_family"]["global"]
+    assert g["unit"] == "share" and g["reached"]
+    assert abs(g["budget"] - recast) < 1e-4 * recast and abs(got - recast) < 1e-4 * recast
+    with pytest.raises(ValueError):
+        R.warm_start(make(), gr, 0.2, src, 0.9, **extra, global_family="input_contrast", global_family_rho=1.0,
+                     global_family_floor=0.04)                                         # energy unit, up / v targets
+
+
+def test_global_family_per_direction_s_in_warm_start():
+    """global_family_s_gamma contracts each chosen direction by its own c_j and still removes the ReCAST total."""
+    import recast_global_families as RG
+    import recast_output_contrast as RO
+    extra = dict(whitening_rho=1.0, representation_output="gradient", rank_multiplier=1.0)
+    t, gr, src, cov_f, cov_r = _write_targets(97)
+    w0 = {k: m.weight.detach().clone() for k, m in t.items()}
+    R.warm_start(t, gr, 0.2, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r)
+    recast = sum(RO.output_energy(t[k].weight.detach() - w0[k], cov_f[k]) for k in t)
+    t, gr, src, cov_f, cov_r = _write_targets(97)
+    _, rep = R.warm_start(t, gr, 0.2, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r,
+                          global_family="input_contrast", global_family_rho=0.5, global_family_floor=0.04,
+                          global_family_s_gamma=1.0)
+    g = rep[next(iter(t))]["global_family"]["global"]
+    assert g["s_gamma"] == 1.0
+    if g["reached"]:
+        assert abs(sum(RO.output_energy(t[k].weight.detach() - w0[k], cov_f[k]) for k in t) - recast) < 1e-4 * recast
+    for k in t:
+        r = rep[k]["global_family"]
+        part = RG.target_directions(w0[k].float(), cov_f[k], cov_r[k], src[k], gr[k], "input_contrast", 0.5,
+                                    s_gamma=1.0, s_min=0.04)
+        expect = RG.global_delta(part, w0[k].float(), r["directions"], 1.0, r["beta_last"])
+        assert torch.allclose(t[k].weight.detach() - w0[k], expect.float(), atol=1e-5)
+    with pytest.raises(ValueError):
+        R.warm_start(t, gr, 0.2, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r,
+                     global_family="input_contrast", global_family_rho=0.5, global_family_floor=0.04,
+                     global_family_s_gamma=-1.0)
+
+
+def test_global_family_calibrated_threshold_in_warm_start():
+    """global_family_s_threshold_gamma removes the ReCAST total with one threshold lambda* over all targets."""
+    import recast_global_families as RG
+    import recast_output_contrast as RO
+    extra = dict(whitening_rho=1.0, representation_output="gradient", rank_multiplier=1.0)
+    t, gr, src, cov_f, cov_r = _write_targets(98)
+    w0 = {k: m.weight.detach().clone() for k, m in t.items()}
+    R.warm_start(t, gr, 0.3, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r)
+    recast = sum(RO.output_energy(t[k].weight.detach() - w0[k], cov_f[k]) for k in t)
+    t, gr, src, cov_f, cov_r = _write_targets(98)
+    _, rep = R.warm_start(t, gr, 0.3, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r,
+                          global_family="input_contrast", global_family_rho=0.5, global_family_floor=0.04,
+                          global_family_s_threshold_gamma=2.0)
+    g = rep[next(iter(t))]["global_family"]["global"]
+    assert g["s_threshold_gamma"] == 2.0 and g["threshold"] > 0
+    if g["reached"]:
+        assert abs(sum(RO.output_energy(t[k].weight.detach() - w0[k], cov_f[k]) for k in t) - recast) < 1e-3 * recast
+    with pytest.raises(ValueError):
+        R.warm_start(t, gr, 0.3, src, 0.9, **extra, forget_covariances=cov_f, retain_covariances=cov_r,
+                     global_family="input_contrast", global_family_rho=0.5, global_family_floor=0.04,
+                     global_family_s_threshold_gamma=2.0, global_family_s_gamma=1.0)

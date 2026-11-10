@@ -19,13 +19,28 @@ scripts; none of this touches the engram package.
 
 from __future__ import annotations
 
+import math
 import zlib
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from recast_bases import compare_cores, weight_components
+from recast_contraction import (MODES as CONTRACTION_MODES, component_profile, contraction_beta, contraction_delta,
+                                contraction_report, forget_retain_score)
+from recast_output_contrast import (output_contrast_contraction, output_contrast_simulation, output_energy,
+                                    output_energy_report)
+
+from recast_direction_families import FAMILIES, family_contraction_delta, family_report, ordered_directions
+from recast_global_families import (BUDGET_UNITS, GLOBAL_ORDERS, calibrated_selection, delta_from_coef, global_delta,
+                                    global_selection, target_directions)
+
+OUTPUT_CONTRAST_RHOS = (0.01, 0.1, 1.0, 30.0)  # ridges of the simulated output-contrast contractions
+FAMILY_RHOS = (0.1, 1.0, 30.0)  # ridges of the direction-family comparison
+from recast_scores import RULES as SHRINK_SCORES, row_factors, score_summary, shrink_scores, update_stats
 
 COS_EPS = 1.0e-12      # cosine_against_negative_gradient
 ENERGY_EPS = 1.0e-12   # compute_dash_svd_subspace
@@ -43,10 +58,13 @@ TARGET_PROFILES = {
     "mlp_up_gate": (("up_proj", "gate_proj"), False),
     "mlp_gate_down": (("gate_proj", "down_proj"), False),
     "down_up_o": (("down_proj", "up_proj", "o_proj"), False),
+    "down_o": (("down_proj", "o_proj"), False),
+    "up_o": (("up_proj", "o_proj"), False),
     "down_up_q": (("down_proj", "up_proj", "q_proj"), False),
     "mlp_o": (("gate_proj", "up_proj", "down_proj", "o_proj"), False),
     "down_up_v": (("down_proj", "up_proj", "v_proj"), False),
     "down_up_o_v": (("down_proj", "up_proj", "o_proj", "v_proj"), False),
+    "down_o_v": (("down_proj", "o_proj", "v_proj"), False),
     "head": ((), True),
     "attn_q": (("q_proj",), False),
     "attn_k": (("k_proj",), False),
@@ -149,6 +167,67 @@ def collect_mean_gradients(
     return {n: s / float(count) for n, s in sums.items()}, count
 
 
+def collect_example_gradient_moments(
+    model: nn.Module,
+    loader: Iterable,
+    targets: Dict[str, nn.Linear],
+    batch_fn: Callable[[dict], dict],
+) -> Tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], int]:
+    """Second moments of the per-example gradients (extension, user 2026-11-02), float64.
+
+    Example e of a batch of size B gets ``g_e = B sum_t delta_t x_t^T``: its share of the gradient of the batch's mean
+    loss (``delta_t`` the loss gradient at the target's output, ``x_t`` its input, over the example's positions with
+    ``attention_mask`` 1), times B, so that the mean of the g_e over the dataset is exactly the mean gradient of
+    ``collect_mean_gradients``. Returns per target ``(E[g g^T], E[g^T g])`` (out x out, in x in), computed as
+    ``D_e^T (X_e X_e^T) D_e`` and ``X_e^T (D_e D_e^T) X_e`` without forming any g_e; their mean part is
+    ``G G^T`` and ``G^T G``. Modes and ``requires_grad`` flags are restored as in ``collect_mean_gradients``.
+    """
+    modes = [(m, m.training) for m in model.modules()]
+    flags = [(p, p.requires_grad) for p in model.parameters()]
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    names = list(targets)
+    for n in names:
+        targets[n].weight.requires_grad_(True)
+    saved: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    hooks = [targets[n].register_forward_hook(lambda mod, inp, out, n=n: saved.__setitem__(n, (inp[0].detach(), out)))
+             for n in names]
+    sums = {n: (torch.zeros(targets[n].out_features, targets[n].out_features, dtype=torch.float64,
+                            device=targets[n].weight.device),
+                torch.zeros(targets[n].in_features, targets[n].in_features, dtype=torch.float64,
+                            device=targets[n].weight.device)) for n in names}
+    count = 0
+    try:
+        for batch in loader:
+            inputs = batch_fn(batch)
+            size = int(inputs["input_ids"].shape[0])
+            loss = model(**inputs).loss
+            deltas = torch.autograd.grad(loss, [saved[n][1] for n in names], allow_unused=True)
+            mask = inputs["attention_mask"].unsqueeze(-1).float()
+            for n, d in zip(names, deltas):
+                if d is None:
+                    continue
+                x = saved[n][0].float() * mask
+                d = d.float() * mask * float(size)
+                out_sum, in_sum = sums[n]
+                out_sum.add_(d.flatten(0, -2).transpose(0, 1) @ (x @ x.transpose(-1, -2) @ d).flatten(0, -2))
+                in_sum.add_(x.flatten(0, -2).transpose(0, 1) @ (d @ d.transpose(-1, -2) @ x).flatten(0, -2))
+            saved.clear()
+            count += size
+    finally:
+        for h in hooks:
+            h.remove()
+        saved.clear()
+        for p, flag in flags:
+            p.requires_grad_(flag)
+        for m, mode in modes:
+            m.train(mode)
+    if count == 0:
+        raise ValueError("empty source loader")
+    return {n: (o / float(count), i / float(count)) for n, (o, i) in sums.items()}, count
+
+
 # ---------------- retain input filter (extension of this port) ----------------
 
 @torch.no_grad()
@@ -236,6 +315,13 @@ class Basis:
     rank: int
     total_rank: int
     evr: float
+    rank_in: Optional[int] = None  # rows of vh when they differ from ``rank`` (the columns of u); None: the same
+
+
+def share_rank(energies: torch.Tensor, threshold: float) -> int:
+    """Smallest k whose leading ``energies`` (in their given order) hold at least ``threshold`` of their sum."""
+    cum = torch.cumsum(energies.double().clamp_min(0.0), 0)
+    return min(int((cum / cum[-1] < threshold).sum()) + 1, int(energies.numel()))
 
 
 def svd_basis(source: torch.Tensor, evr_threshold: float, eps: float = ENERGY_EPS,
@@ -313,11 +399,12 @@ def representation_basis(source: torch.Tensor, cov_forget: torch.Tensor, cov_ret
     output restriction, ``u=None``), ``gradient`` (left singular vectors of ``G_f V``: the outputs the
     forget loss moves along those inputs), ``whitened_gradient`` (the top-``rank`` left singular
     vectors of ``G_f (C_r + eps I)^-1/2``, the output side of C) or ``representation`` (the same
-    contrast for the output covariances ``W C W^T``). The rank is an explicit budget; ``evr`` reports
-    the forget-gradient energy fraction the restriction keeps, ``||P(G_f)||^2 / ||G_f||^2``.
+    contrast for the output covariances ``W C W^T``). ``output_only`` (user, 2026-10-29) restricts only the output side
+    (the ``representation`` contrast) and leaves every input direction (``Vh = I``). The rank is an explicit budget;
+    ``evr`` reports the forget-gradient energy fraction the restriction keeps, ``||P(G_f)||^2 / ||G_f||^2``.
     """
-    if output_side not in ("identity", "gradient", "whitened_gradient", "representation"):
-        raise ValueError(f"output_side must be identity, gradient, whitened_gradient or representation, "
+    if output_side not in ("identity", "gradient", "whitened_gradient", "representation", "output_only"):
+        raise ValueError(f"output_side must be identity, gradient, whitened_gradient, representation or output_only, "
                          f"got {output_side!r}")
     if rho <= 0 or rank < 1:
         raise ValueError(f"rho and rank must be positive, got {rho}, {rank}")
@@ -327,6 +414,14 @@ def representation_basis(source: torch.Tensor, cov_forget: torch.Tensor, cov_ret
     total_rank = min(g.shape)
     if float(torch.trace(cov_forget)) <= eps or float(g.square().sum()) <= eps:
         return Basis(False, "zero_energy", None, None, 0, total_rank, 0.0)
+    if output_side == "output_only":
+        w = weight.reshape(weight.shape[0], -1).double()
+        rank = min(rank, g.shape[0])
+        u = _generalised_top(w @ cov_forget.double() @ w.transpose(0, 1), w @ cov_retain.double() @ w.transpose(0, 1),
+                             rho, rank)
+        kept = u @ (u.transpose(0, 1) @ g)
+        eye = torch.eye(g.shape[1], dtype=torch.float32, device=g.device)
+        return Basis(True, "", u.float().contiguous(), eye, rank, total_rank, float(kept.square().sum() / g.square().sum()))
     rank = min(rank, g.shape[1])
     numerator = cov_forget.double() / float(torch.trace(cov_forget))
     if input_mix < 1.0:
@@ -349,6 +444,104 @@ def representation_basis(source: torch.Tensor, cov_forget: torch.Tensor, cov_ret
     kept = g @ v @ v.transpose(0, 1) if u is None else u @ (u.transpose(0, 1) @ g @ v) @ v.transpose(0, 1)
     return Basis(True, "", None if u is None else u.float().contiguous(), v.transpose(0, 1).float().contiguous(),
                  rank, total_rank, float(kept.square().sum() / g.square().sum()))
+
+
+GRADIENT_CONTRAST_SIDES = ("both", "input")
+CONTRAST_RANK_RULES = ("side_energy", "kept_energy")  # own-spectrum ranks of the contrast basis (gradient_contrast_basis)
+
+
+def _rank_arguments(rank: Optional[int], energy_threshold: Optional[float],
+                    kept_threshold: Optional[float] = None) -> None:
+    if sum(x is not None for x in (rank, energy_threshold, kept_threshold)) != 1:
+        raise ValueError("give exactly one of rank, energy_threshold and kept_threshold")
+    if rank is not None and rank < 1:
+        raise ValueError(f"rank must be positive, got {rank}")
+    for name, value in (("energy_threshold", energy_threshold), ("kept_threshold", kept_threshold)):
+        if value is not None and not 0.0 < float(value) <= 1.0:
+            raise ValueError(f"{name} must be in (0, 1], got {value}")
+
+
+def gradient_contrast_basis(source: torch.Tensor, grad_retain: torch.Tensor, rank: Optional[int], rho: float,
+                            sides: str, eps: float = ENERGY_EPS, energy_threshold: Optional[float] = None,
+                            kept_threshold: Optional[float] = None) -> Basis:
+    """Restriction basis from the forget-vs-retain contrast of the mean gradients (extension, user 2026-11-01): the
+    plain basis with the singular vectors of G_f replaced by contrast directions.
+
+    Input side: the leading directions of ``(G_f^T G_f / tr) v = lambda (G_r^T G_r / tr + rho / in I) v``.
+    Output side, ``sides="both"``: the leading directions of
+    ``(G_f G_f^T / tr) u = lambda (G_r G_r^T / tr + rho / out I) u``; ``sides="input"`` (control): the leading
+    left singular vectors of G_f, the plain basis's output side. Each family is orthonormalised in the order
+    of lambda (``recast_direction_families.ordered_directions``). ``rank`` is an explicit budget, the same on both
+    sides; ``energy_threshold`` instead (user, 2026-11-02) gives each side the smallest number of leading directions
+    that holds at least that share of the mean forget gradient's energy on that side, ``sum_i ||G_f v_i||^2 /
+    ||G_f||^2`` on the input side and ``sum_i ||G_f^T u_i||^2 / ||G_f||^2`` on the output side (lambda is a ratio, not
+    an energy; for the plain basis both shares are its EVR). ``kept_threshold`` instead (user, 2026-11-02) gives both
+    sides one rank, the smallest r whose two-sided restriction keeps at least that share of the mean forget gradient's
+    energy, ``||U_r U_r^T G_f V_r V_r^T||^2 / ||G_f||^2`` (at most min(out, in); for the plain basis again its EVR).
+    ``evr`` reports the forget-gradient energy fraction the two-sided restriction keeps, ``||P(G_f)||^2 / ||G_f||^2``.
+    """
+    if sides not in GRADIENT_CONTRAST_SIDES:
+        raise ValueError(f"sides must be one of {GRADIENT_CONTRAST_SIDES}, got {sides!r}")
+    if rho <= 0:
+        raise ValueError(f"rho must be positive, got {rho}")
+    _rank_arguments(rank, energy_threshold, kept_threshold)
+    g = source.reshape(source.shape[0], -1).double()
+    gr = grad_retain.reshape(grad_retain.shape[0], -1).to(device=g.device, dtype=g.dtype)
+    total_rank = min(g.shape)
+    if float(g.square().sum()) <= eps or float(gr.square().sum()) <= eps:
+        return Basis(False, "zero_energy", None, None, 0, total_rank, 0.0)
+    v = ordered_directions(g.transpose(0, 1) @ g, gr.transpose(0, 1) @ gr, rho)
+    if sides == "both":
+        u = ordered_directions(g @ g.transpose(0, 1), gr @ gr.transpose(0, 1), rho)
+        out_energy = (g.transpose(0, 1) @ u).square().sum(0) if energy_threshold is not None else None
+    else:
+        u, s, _ = torch.linalg.svd(g, full_matrices=False)
+        out_energy = s.square()
+    if rank is not None:
+        r_out = r_in = min(rank, total_rank)
+    elif kept_threshold is not None:  # kept(r) = sum_{i, j <= r} (u_i^T G_f v_j)^2 / ||G_f||^2
+        core = (u[:, :total_rank].transpose(0, 1) @ g @ v[:, :total_rank]).square()
+        curve = torch.cumsum(torch.cumsum(core, 0), 1).diagonal() / g.square().sum()
+        r_out = r_in = min(int((curve < kept_threshold).sum()) + 1, total_rank)
+    else:
+        r_out, r_in = share_rank(out_energy, energy_threshold), share_rank((g @ v).square().sum(0), energy_threshold)
+    u, v = u[:, :r_out], v[:, :r_in]
+    kept = u @ (u.transpose(0, 1) @ g @ v) @ v.transpose(0, 1)
+    return Basis(True, "", u.float().contiguous(), v.transpose(0, 1).float().contiguous(), r_out, total_rank,
+                 float(kept.square().sum() / g.square().sum()), r_in if energy_threshold is not None else None)
+
+
+def gradient_moment_basis(source: torch.Tensor, moment_out: torch.Tensor, moment_in: torch.Tensor,
+                          rank: Optional[int] = None, eps: float = ENERGY_EPS,
+                          energy_threshold: Optional[float] = None) -> Basis:
+    """Restriction basis from the per-example forget gradients (extension, user 2026-11-02): the plain basis with the
+    singular vectors of the mean gradient G_f replaced by the leading eigenvectors of the per-example second moments
+    (``collect_example_gradient_moments``), U from ``E[g g^T]`` and V from ``E[g^T g]``.
+
+    With one gradient shared by every example the moments are ``G_f G_f^T`` and ``G_f^T G_f`` and the basis spans the
+    plain basis's subspaces; directions along which examples pull in different ways (cancelling in the mean) enter
+    here with their full per-example energy. ``rank`` is an explicit budget, the same on both sides;
+    ``energy_threshold`` instead gives each side the EVR rank of its own moment's spectrum (the smallest k whose
+    leading eigenvalues hold that share of the trace), so the input side of a wide weight may exceed min(out, in).
+    ``evr`` reports the mean-gradient energy fraction the restriction keeps, ``||P(G_f)||^2 / ||G_f||^2``, as
+    ``gradient_contrast_basis`` does.
+    """
+    _rank_arguments(rank, energy_threshold)
+    g = source.reshape(source.shape[0], -1).double()
+    total_rank = min(g.shape)
+    if not torch.isfinite(g).all() or float(g.square().sum()) <= eps:
+        return Basis(False, "zero_energy", None, None, 0, total_rank, 0.0)
+    lam_out, u = torch.linalg.eigh(moment_out.to(device=g.device, dtype=torch.float64))
+    lam_in, v = torch.linalg.eigh(moment_in.to(device=g.device, dtype=torch.float64))
+    lam_out, u, lam_in, v = lam_out.flip(0), u.flip(1), lam_in.flip(0), v.flip(1)
+    if rank is not None:
+        r_out = r_in = min(rank, total_rank)
+    else:
+        r_out, r_in = share_rank(lam_out, energy_threshold), share_rank(lam_in, energy_threshold)
+    u, v = u[:, :r_out], v[:, :r_in]
+    kept = u @ (u.transpose(0, 1) @ g @ v) @ v.transpose(0, 1)
+    return Basis(True, "", u.float().contiguous(), v.transpose(0, 1).float().contiguous(), r_out, total_rank,
+                 float(kept.square().sum() / g.square().sum()), None if rank is not None else r_in)
 
 
 def project(delta: torch.Tensor, u: Optional[torch.Tensor], vh: torch.Tensor) -> torch.Tensor:
@@ -512,8 +705,52 @@ def scale_update(original: torch.Tensor, baseline: torch.Tensor, t: float) -> to
     return w0 + float(t) * (baseline.float().to(w0.device) - w0)
 
 
-def parse_type_scales(spec: str) -> Dict[str, float]:
-    """``down_proj=1,up_proj=0.714`` -> {projection: t}, the per-type warm-start scale (extension)."""
+# The two writes of a decoder layer into the residual stream, in the order the layer adds them.
+WRITE_PROJECTIONS = ("self_attn.o_proj", "mlp.down_proj")
+
+
+def residual_write_divisors(num_layers: int, factors: Dict[str, float], prefix: str = "model.layers.") -> Dict[str, float]:
+    """Scaling the residual stream by c_k at write k (``h <- c_k h + write_k``, extension: write compensation) leaves
+    every RMSNorm read unchanged if instead write k and every later write are divided by ``c_1 ... c_k``; returns that
+    divisor for every o_proj and down_proj in layer order (factor 1 for a write without one)."""
+    out, prod = {}, 1.0
+    for i in range(num_layers):
+        for p in WRITE_PROJECTIONS:
+            name = f"{prefix}{i}.{p}"
+            prod *= float(factors.get(name, 1.0))
+            out[name] = prod
+    return out
+
+
+@torch.no_grad()
+def apply_write_divisors(model: nn.Module, divisors: Dict[str, float]) -> None:
+    """Divide each named write's weight by its divisor in place (the writes have no bias in Llama)."""
+    modules = dict(model.named_modules())
+    for name, d in divisors.items():
+        if getattr(modules[name], "bias", None) is not None:
+            raise ValueError(f"{name} has a bias; the write compensation assumes none")
+        modules[name].weight.div_(d)
+
+
+def update_budget(floors: Dict[str, float], energies: Dict[str, float]) -> float:
+    """``B = sqrt(sum_k (1 - s_k)^2 E_k)``: the Frobenius norm of the whole restricted update when every row of a type
+    k sits at its floor s_k, so that each target's update is ``(s_k - 1) P(W_l)``; ``E_k = sum_{l in k} ||P(W_l)||^2``
+    (the ``projected_weight_norm`` of the warm-start report, squared and summed per type)."""
+    if set(floors) != set(energies):
+        raise ValueError(f"floors and energies need the same types, got {sorted(floors)} and {sorted(energies)}")
+    return math.sqrt(sum((1.0 - floors[k]) ** 2 * energies[k] for k in floors))
+
+
+def uniform_floor_for_budget(budget: float, energies: Dict[str, float]) -> Optional[float]:
+    """The one floor s with ``update_budget({k: s}, energies) = budget``, ``1 - budget / sqrt(sum_k E_k)``; None when
+    no s in [0, 1] reaches it (the budget exceeds the full projected norm, i.e. it would need s < 0)."""
+    total = math.sqrt(sum(energies.values()))
+    s = 1.0 - budget / total
+    return s if 0.0 <= s <= 1.0 else None
+
+
+def parse_type_values(spec: str) -> Dict[str, float]:
+    """``down_proj=0.2,up_proj=0.5`` -> {projection: value}, e.g. a shrink floor per projection type (extension)."""
     out: Dict[str, float] = {}
     for item in spec.split(","):
         key, sep, value = item.partition("=")
@@ -575,7 +812,7 @@ def mix_sources(grad_forget: torch.Tensor, grad_retain: torch.Tensor, n_forget: 
 def warm_start(
     targets: Dict[str, nn.Linear],
     grad_retain: Dict[str, torch.Tensor],
-    s_min: float,
+    s_min: Union[float, Dict[str, float]],
     restriction_source: Optional[Dict[str, torch.Tensor]] = None,
     evr_threshold: Optional[float] = None,
     unrestricted: Iterable[str] = (),
@@ -586,6 +823,9 @@ def warm_start(
     whitening_rho: Optional[float] = None,
     rank_multiplier: Optional[float] = None,
     representation_output: Optional[str] = None,
+    gradient_contrast: Optional[str] = None,
+    gradient_moments: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    contrast_rank_rule: str = "side_energy",
     forget_covariances: Optional[Dict[str, torch.Tensor]] = None,
     retain_covariances: Optional[Dict[str, torch.Tensor]] = None,
     representation_mix: float = 1.0,
@@ -594,8 +834,32 @@ def warm_start(
     component_diagnostics: bool = False,
     component_seed: int = 0,
     direction_weighting: Optional[str] = None,
+    shrink_score: str = "original",
+    score_diagnostics: bool = False,
+    core_diagnostics: bool = False,
+    weight_contraction: Optional[str] = None,
+    contraction_strength: float = 1.0,
+    contraction_residual: float = 0.0,
+    contraction_diagnostics: bool = False,
+    output_diagnostics: bool = False,
+    output_contrast_rho: Optional[float] = None,
+    family_diagnostics: bool = False,
+    family_contraction: Optional[str] = None,
+    family_rho: Optional[float] = None,
+    global_family: Optional[str] = None,
+    global_family_rho: Optional[float] = None,
+    global_family_floor: Optional[float] = None,
+    global_family_order: str = "score",
+    global_family_alpha: Optional[float] = None,
+    global_family_budget_unit: str = "energy",
+    global_family_s_gamma: Optional[float] = None,
+    global_family_s_rule: Optional[str] = None,
+    global_family_s_threshold_gamma: Optional[float] = None,
 ) -> Tuple[Dict[str, Restriction], Dict[str, dict]]:
     """Apply the ReCAST warm start in place. Restricted when ``restriction_source`` is given.
+
+    ``s_min`` is the shrink floor, one value for every target or (extension) a dict with one floor per projection
+    type, the last component of the target name (``{"down_proj": 0.2, "up_proj": 0.5}``).
 
     Restricted targets whose source has no energy follow ``zero_energy_behavior=skip_projection``:
     the raw shrink proposal is applied and the target gets no basis (it stays a native,
@@ -618,6 +882,16 @@ def warm_start(
     ``representation_output`` (extension, basis D) builds each basis with ``representation_basis``
     from ``forget_covariances`` and ``retain_covariances`` at ``whitening_rho`` and ``representation_mix``
     (the input-side mix of forget activations and forget gradient); it needs a budget.
+    ``gradient_contrast`` (extension, user 2026-11-01: ``both`` or ``input``) builds each basis with
+    ``gradient_contrast_basis`` from the forget gradient ``restriction_source`` and ``grad_retain`` at ``whitening_rho``;
+    with ``rank_multiplier`` both sides get its rank, without it (user 2026-11-02) ``contrast_rank_rule``
+    ``side_energy`` gives each side the rank holding ``evr_threshold`` of the mean forget gradient's energy on that side
+    and ``kept_energy`` both sides the smallest rank whose two-sided restriction keeps ``evr_threshold`` of it.
+    ``gradient_moments`` (extension, user 2026-11-02: per target the per-example forget-gradient moments
+    ``(E[g g^T], E[g^T g])`` of ``collect_example_gradient_moments``) builds each basis with ``gradient_moment_basis``;
+    with ``rank_multiplier`` both sides get its rank, without it each side the EVR rank of its own moment's spectrum at
+    ``evr_threshold``. These own-spectrum ranks differ between the sides, so they exclude component selection and
+    diagnostics, direction weighting and score and core diagnostics.
     ``forget_output_target`` q* (extension: a budget in forget-output units, instead of
     ``rank_multiplier``) gives every restricted target the smallest rank of its basis family whose delta
     changes the forget outputs by ``q_f = tr(D C_f D^T) / tr(W C_f W^T) >= q*`` (``C_f`` from
@@ -632,8 +906,53 @@ def warm_start(
     whose input covector carries a larger share of forget than of retain input energy. ``direction_weighting
     ="contrast"`` (gradient-free) shrinks each input direction of the basis by s_k = 1 - (1 - s) w_k with w_k from
     ``direction_contrast_weights`` (``forget_covariances`` / ``retain_covariances``), i.e. the update
-    ``U U^T X Vh^T diag(w) Vh``. Targets are updated independently from the Init Fine. weights and gradients, each
-    exactly once.
+    ``U U^T X Vh^T diag(w) Vh``. ``shrink_score`` (extension, Stage 2) picks the row score of S on each active
+    restricted target from ``recast_scores``: ``original`` (the cosine above, unchanged), ``projected_row``,
+    ``projected_sensitivity`` or ``global_projected`` (one factor per matrix); the floor and the proposal
+    ``P((S - I) W)`` stay. ``score_diagnostics`` reports, per active restricted target, every rule's score summary,
+    the first-order retain / forget change ``<G, Delta W>`` of the applied update and every rule's update norm on a
+    floor grid (for norm matching). ``core_diagnostics`` (Stage 3, ``recast_bases.compare_cores``) compares, per active
+    restricted target, the weight core ``U^T W Vh^T`` with the update core ``U^T (S - I) W Vh^T`` for the applied S,
+    for each rule's S at the same floor and for a control S with factors drawn uniformly from [floor, 1] (seeded by
+    the target name), with the gradients' alignment and, given both covariances, the input contrast of the leading
+    directions; it changes no update. ``weight_contraction`` (extension, ``recast_contraction``) replaces the update
+    of each active restricted target by ``-sum_j beta_j E_j`` over the weight-core components ``E_j = kappa_j u_j
+    v_j^T`` of ``P(W)``: beta_j = ``contraction_strength`` on the components with the largest kappa (``top``), on
+    random ones (``random``, seeded by ``component_seed`` and the target name) or on those with the largest first-order
+    forget-minus-retain loss increase per unit of moved energy (``forget_retain``, from the forget gradient
+    ``restriction_source`` and ``grad_retain``) until the displacement equals
+    ``(1 - floor) ||P(W)||``, that of ReCAST with every row at the floor; ``contraction`` per target reports it with
+    the input contrast of the moved energy; ``contraction_residual`` leaves every contracted component that singular
+    value instead of 0. ``contraction_diagnostics`` reports, per active restricted target, every weight-core
+    component's kappa, input contrast and forget / retain gradient alignment (``contraction_components``) without
+    changing the update. ``output_diagnostics`` (``recast_output_contrast``) reports, per active restricted target, the
+    output ratios and removed output shares on forget and retain inputs of the applied update (``output_energy``), of
+    every SVD ordering at the same displacement when the components are computed (``output_energy_svd``) and, for
+    down_proj and o_proj, of the output-contrast contraction at each ridge of ``OUTPUT_CONTRAST_RHOS`` with the
+    applied displacement (``output_contrast``); it changes no update. ``output_contrast_rho`` (extension) replaces the
+    update of each active restricted target by the output-contrast contraction at that ridge with the displacement of
+    the ReCAST update (``output_contrast_applied``). ``family_diagnostics`` (``recast_direction_families``) reports, for
+    down_proj and o_proj, the retain output share each family of forget-specific directions (output, gradient and
+    input contrast at each ridge of ``FAMILY_RHOS``) removes when it removes the forget output share of the applied
+    update (``families``); it changes no update. ``family_contraction`` (``output_contrast`` or ``input_contrast``,
+    with ``family_rho``) replaces the update of each active restricted target by that family's removal of the same
+    forget output share as the ReCAST update (``family_contraction`` per target). ``global_family`` (one of
+    ``recast_direction_families.FAMILIES``, with ``global_family_rho``, ``global_family_floor`` and
+    ``global_family_order``; ``recast_global_families``) replaces the updates of all targets (down_proj and o_proj
+    only) together: the family's directions of every target enter one order (``score``: by lambda; ``random``: keys
+    drawn per target from a generator seeded by ``component_seed`` and the target name; ``energy_ratio``: by
+    ``e_f / e_r^global_family_alpha``, the absolute output energies of each direction alone), each chosen direction keeps
+    ``global_family_floor`` of its part, until the forget output energy removed over all targets equals the total the
+    ReCAST updates at ``s_min`` remove (``global_family`` per target, the totals under ``global``).
+    ``global_family_budget_unit="share"`` counts each target's removed forget energy as a share of its own forget output
+    energy and matches the sum of the ReCAST updates' shares instead; it admits targets of any type (``energy`` admits
+    down_proj and o_proj only, whose outputs share the residual stream). ``global_family_s_gamma`` gives each direction
+    its own kept share ``clip(lambda^-gamma, global_family_floor, 1)`` instead of the floor itself;
+    ``global_family_s_rule="retain_share"`` gives it ``clip(e_r / (e_f + e_r), global_family_floor, 1)`` from the
+    absolute output energies of removing the direction alone; ``global_family_s_threshold_gamma`` contracts every
+    direction by ``clip((lambda* / lambda)^gamma, global_family_floor, 1)`` with one threshold lambda* chosen so that
+    the budget is met (``recast_global_families.calibrated_selection``). Targets are updated
+    independently from the Init Fine. weights and gradients, each exactly once.
     """
     if alignment_scope not in ("full_space", "restriction_subspace"):
         raise ValueError(f"alignment_scope must be full_space or restriction_subspace, got {alignment_scope!r}")
@@ -641,6 +960,15 @@ def warm_start(
         raise ValueError(f"layer_scaling must be none, subspace_norm or subspace_norm_mean, got {layer_scaling!r}")
     unrestricted = set(unrestricted)
     restricted = restriction_source is not None
+    if isinstance(s_min, dict):
+        missing = sorted({n.rsplit(".", 1)[-1] for n in targets} - set(s_min))
+        if missing or layer_scaling != "none":
+            raise ValueError(f"per-type floors need a floor for every target type (missing {missing}) and "
+                             "layer_scaling none")
+
+    def floor_of(name):
+        return float(s_min[name.rsplit(".", 1)[-1]] if isinstance(s_min, dict) else s_min)
+
     if restricted and evr_threshold is None:
         raise ValueError("restricted warm start needs evr_threshold")
     if not restricted and (alignment_scope != "full_space" or layer_scaling != "none" or input_filters is not None
@@ -664,17 +992,112 @@ def warm_start(
             or forget_covariances is None or retain_covariances is None):
         raise ValueError("direction_weighting='contrast' needs a restriction, both covariances, no input filter and "
                          "no component selection or diagnostics (they decompose the unweighted update)")
+    if shrink_score not in SHRINK_SCORES:
+        raise ValueError(f"shrink_score must be one of {SHRINK_SCORES}, got {shrink_score!r}")
+    if (shrink_score != "original" or score_diagnostics or core_diagnostics) and (
+            not restricted or alignment_scope != "full_space" or layer_scaling != "none" or input_filters is not None
+            or direction_weighting is not None or component_selection is not None
+            or forget_output_target is not None):
+        raise ValueError("shrink_score other than original and score_diagnostics need a restriction, full_space "
+                         "alignment, no layer scaling, input filter, direction weighting, component selection or "
+                         "forget-output target (Stage 2 changes only the row scores)")
     if forget_output_target is not None and (
             not restricted or not 0.0 < forget_output_target < 1.0 or rank_multiplier is not None
             or forget_covariances is None or alignment_scope != "full_space" or layer_scaling != "none"
             or input_filters is not None):
         raise ValueError("forget_output_target needs a restriction, a value in (0, 1), forget_covariances, "
                          "full_space alignment, no layer scaling, no input filter and no rank_multiplier")
+    if gradient_contrast is not None and (
+            gradient_contrast not in GRADIENT_CONTRAST_SIDES or not restricted
+            or whitening_rho is None or whitening_rho <= 0 or whitening is not None or representation_output is not None
+            or forget_output_target is not None):
+        raise ValueError(f"a gradient-contrast basis ({GRADIENT_CONTRAST_SIDES}) needs a restriction and a positive "
+                         "whitening_rho, and excludes whitening, representation bases and forget_output_target")
+    if gradient_moments is not None and (
+            not restricted or gradient_contrast is not None or whitening is not None
+            or representation_output is not None or forget_output_target is not None):
+        raise ValueError("per-example gradient moments need a restriction and exclude gradient-contrast, whitened and "
+                         "representation bases and forget_output_target")
+    own_spectrum = (gradient_contrast is not None or gradient_moments is not None) and rank_multiplier is None
+    if own_spectrum and (component_selection is not None or component_diagnostics or direction_weighting is not None
+                         or score_diagnostics or core_diagnostics):
+        raise ValueError("own-spectrum ranks (a gradient-contrast or per-example basis without rank_multiplier) exclude "
+                         "component selection and diagnostics, direction weighting and score and core diagnostics")
+    if contrast_rank_rule not in CONTRAST_RANK_RULES or (
+            contrast_rank_rule != "side_energy" and (gradient_contrast is None or not own_spectrum)):
+        raise ValueError(f"contrast_rank_rule must be one of {CONTRAST_RANK_RULES}; other than side_energy it needs a "
+                         "gradient-contrast basis without rank_multiplier")
+    contrast_thresholds = ({} if not own_spectrum else {"kept_threshold": evr_threshold}
+                           if contrast_rank_rule == "kept_energy" else {"energy_threshold": evr_threshold})
     if representation_output is not None and (
             (rank_multiplier is None and forget_output_target is None) or whitening_rho is None
             or whitening is not None or forget_covariances is None or retain_covariances is None):
         raise ValueError("a representation basis needs rank_multiplier or forget_output_target, whitening_rho and "
                          "both covariances, and excludes whitening")
+    if weight_contraction is not None and (
+            weight_contraction not in CONTRACTION_MODES or not 0.0 < contraction_strength <= 1.0
+            or representation_output is None or alignment_scope != "full_space" or layer_scaling != "none"
+            or input_filters is not None or direction_weighting is not None or component_selection is not None
+            or component_diagnostics or forget_output_target is not None or shrink_score != "original"
+            or score_diagnostics or core_diagnostics
+            or any(1.0 - floor_of(n) > contraction_strength for n in targets)):
+        raise ValueError(f"weight_contraction ({CONTRACTION_MODES}) needs a strength in (0, 1], a representation "
+                         "basis, full_space alignment, the original shrink score, floors with 1 - floor <= strength "
+                         "and no layer scaling, input filter, direction weighting, component selection or "
+                         "diagnostics, forget-output target, score or core diagnostics")
+    if contraction_residual < 0.0 or (contraction_residual > 0.0 and weight_contraction is None):
+        raise ValueError("contraction_residual needs a weight_contraction and a value >= 0")
+    if contraction_diagnostics and (
+            representation_output is None or alignment_scope != "full_space" or layer_scaling != "none"
+            or input_filters is not None or direction_weighting is not None or component_selection is not None
+            or forget_output_target is not None):
+        raise ValueError("contraction_diagnostics needs a representation basis, full_space alignment and no layer "
+                         "scaling, input filter, direction weighting, component selection or forget-output target")
+    if output_diagnostics and (not restricted or forget_covariances is None or retain_covariances is None):
+        raise ValueError("output_diagnostics needs a restriction and both input covariances")
+    if output_contrast_rho is not None and (
+            output_contrast_rho <= 0 or not restricted or forget_covariances is None or retain_covariances is None
+            or weight_contraction is not None or direction_weighting is not None or component_selection is not None
+            or input_filters is not None or forget_output_target is not None or shrink_score != "original"):
+        raise ValueError("output_contrast_rho needs a positive value, a restriction, both input covariances, the "
+                         "original shrink score and no weight contraction, direction weighting, component selection, "
+                         "input filter or forget-output target")
+    if family_diagnostics and (not restricted or forget_covariances is None or retain_covariances is None):
+        raise ValueError("family_diagnostics needs a restriction and both input covariances")
+    if (family_contraction is None) != (family_rho is None) or (family_contraction is not None and (
+            family_contraction not in ("output_contrast", "input_contrast") or family_rho <= 0 or not restricted
+            or forget_covariances is None or retain_covariances is None or weight_contraction is not None
+            or output_contrast_rho is not None or direction_weighting is not None or component_selection is not None
+            or input_filters is not None or forget_output_target is not None or shrink_score != "original")):
+        raise ValueError("family_contraction (output_contrast or input_contrast) needs a positive family_rho, a "
+                         "restriction, both input covariances, the original shrink score and no other update "
+                         "replacement, direction weighting, component selection, input filter or forget-output target")
+    if (global_family is None) != (global_family_rho is None) or (global_family is None) != (
+            global_family_floor is None) or (global_family is not None and (
+            global_family not in FAMILIES or global_family_rho <= 0 or not 0.0 <= global_family_floor < 1.0
+            or global_family_order not in GLOBAL_ORDERS
+            or (global_family_order == "energy_ratio") != (global_family_alpha is not None)
+            or (global_family_alpha is not None and global_family_alpha < 0)
+            or not restricted or forget_covariances is None
+            or retain_covariances is None or unrestricted
+            or global_family_budget_unit not in BUDGET_UNITS
+            or (global_family_s_gamma is not None and global_family_s_gamma <= 0)
+            or global_family_s_rule not in (None, "retain_share")
+            or (global_family_s_rule is not None and global_family_s_gamma is not None)
+            or (global_family_s_threshold_gamma is not None and (
+                global_family_s_threshold_gamma <= 0 or global_family_s_gamma is not None
+                or global_family_s_rule is not None or global_family_order != "score"))
+            or (global_family_budget_unit == "energy"
+                and any(n.rsplit(".", 1)[-1] not in ("down_proj", "o_proj") for n in targets))
+            or weight_contraction is not None or output_contrast_rho is not None or family_contraction is not None
+            or direction_weighting is not None or component_selection is not None or input_filters is not None
+            or forget_output_target is not None or shrink_score != "original")):
+        raise ValueError(f"global_family (one of {FAMILIES}) needs global_family_rho > 0, global_family_floor in "
+                         f"[0, 1), global_family_order in {GLOBAL_ORDERS} (energy_ratio with, and only it, a "
+                         "global_family_alpha >= 0), a restriction of every target, both input "
+                         "covariances, only down_proj / o_proj targets with the energy budget unit, the original "
+                         "shrink score and no other update "
+                         "replacement, direction weighting, component selection, input filter or forget-output target")
 
     # Pass 1: bases and per-target floors.
     bases: Dict[str, Basis] = {}
@@ -691,7 +1114,13 @@ def warm_start(
                 rank = max(1, round(rank_multiplier * reference_rank[name]))
             if forget_output_target is not None:
                 rank = min(module.weight.shape)  # the whole family; the target picks a prefix below
-            if representation_output is not None:
+            if gradient_contrast is not None:
+                bases[name] = gradient_contrast_basis(restriction_source[name], grad_retain[name], rank, whitening_rho,
+                                                      gradient_contrast, **contrast_thresholds)
+            elif gradient_moments is not None:
+                bases[name] = gradient_moment_basis(restriction_source[name], *gradient_moments[name], rank,
+                                                    energy_threshold=evr_threshold if own_spectrum else None)
+            elif representation_output is not None:
                 bases[name] = representation_basis(restriction_source[name], forget_covariances[name],
                                                    retain_covariances[name], module.weight.detach(), rank,
                                                    whitening_rho, representation_output,
@@ -703,11 +1132,11 @@ def warm_start(
                 bases[name] = svd_basis(restriction_source[name], evr_threshold, rank=rank)
             if forget_output_target is not None and bases[name].active:
                 w32 = module.weight.detach().float()
-                proposal = (shrink_factors(row_alignment(w32, grad_retain[name]), s_min) - 1.0).unsqueeze(1) * w32
+                proposal = (shrink_factors(row_alignment(w32, grad_retain[name]), floor_of(name)) - 1.0).unsqueeze(1) * w32
                 bases[name], _ = prefix_for_forget_output(bases[name], restriction_source[name], w32, proposal,
                                                           forget_covariances[name], forget_output_target,
                                                           representation_output == "gradient")
-    floors = {name: float(s_min) for name in targets}
+    floors = {name: floor_of(name) for name in targets}
     rel_norm: Dict[str, float] = {}
     if layer_scaling != "none":
         for name, b in bases.items():
@@ -722,6 +1151,7 @@ def warm_start(
     # Pass 2: alignment, shrink, projection.
     restrictions: Dict[str, Restriction] = {}
     report: Dict[str, dict] = {}
+    family_parts: Dict[str, dict] = {}
     for name, module in targets.items():
         w = module.weight
         w32 = w.detach().float().clone()  # .float() of a float32 weight aliases it; the report needs the original
@@ -731,16 +1161,93 @@ def warm_start(
         g = project(grad_retain[name].float(), basis.u, basis.vh) if in_subspace else grad_retain[name]
         a = row_alignment(shrink_source, g)
         s = shrink_factors(a, floors[name])
+        scores = None
+        if (shrink_score != "original" or score_diagnostics or core_diagnostics) and basis is not None and basis.active:
+            scores = shrink_scores(w32, grad_retain[name], basis.u, basis.vh, eps=COS_EPS)
+            if shrink_score != "original":
+                s = row_factors(scores, shrink_score, floors[name]).float().to(w32.device)
+                a = (torch.full_like(s, scores["global_projected"]) if shrink_score == "global_projected"
+                     else scores[shrink_score].float().to(w32.device))
         proposal = (s - 1.0).unsqueeze(1) * shrink_source   # s * X - X, X = W or P(W)
         info = {"rows": int(s.numel()), "floor": floors[name], "shrink_mean": float(s.mean()),
                 "shrink_at_floor": float((a <= floors[name]).float().mean()), "alignment_mean": float(a.mean()),
-                "proposal_norm": float(proposal.norm())}
+                "proposal_norm": float(proposal.norm()), "shrink_score": shrink_score}
+        if scores is not None and score_diagnostics:
+            # core_row scores the r output directions of the basis, not the rows: no correlation with the original
+            info["scores"] = {rule: score_summary(scores[rule], reference=None if rule == "core_row" else scores["original"])
+                              for rule in ("original", "projected_row", "projected_sensitivity", "core_row")}
+            info["scores"]["global_projected"] = scores["global_projected"]
+            info["scores"]["zero_norm_rows"] = scores["zero_norm_rows"]
+            info["applied_first_order"] = update_stats(w32, s, basis.u, basis.vh, {
+                "retain": grad_retain[name], "forget": restriction_source[name]})
+            info["update_norm_by_floor"] = {
+                rule: {f"{f:g}": update_stats(w32, row_factors(scores, rule, f), basis.u, basis.vh, {})["update_norm"]
+                       for f in (0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5)} for rule in SHRINK_SCORES}
+        if scores is not None and core_diagnostics:
+            gen = torch.Generator().manual_seed(zlib.crc32(name.encode()))
+            control = floors[name] + (1.0 - floors[name]) * torch.rand(s.numel(), generator=gen, dtype=torch.float64)
+            sources = {"applied": s, **{rule: row_factors(scores, rule, floors[name]) for rule in SHRINK_SCORES},
+                       "control_uniform_random": control.to(w32.device)}
+            contrast_fn = None
+            if forget_covariances is not None and retain_covariances is not None:
+                contrast_fn = lambda rows, n=name: input_contrast(rows, forget_covariances[n], retain_covariances[n])  # noqa: E731
+            info["cores"] = {k: compare_cores(w32, f, basis.u, basis.vh, grads={
+                "retain": grad_retain[name], "forget": restriction_source[name]}, contrast_fn=contrast_fn)
+                for k, f in sources.items()}
         if name in rel_norm:
             info["subspace_rel_norm"] = rel_norm[name]
         if name in reference_rank:
             info["reference_rank"] = reference_rank[name]
         if restricted:
             delta = project(proposal, basis.u, basis.vh) if basis.active else proposal
+            if (weight_contraction is not None or contraction_diagnostics) and basis.active:
+                comps = weight_components(w32, basis.u, basis.vh)
+                contrast = input_contrast(comps["right"], forget_covariances[name], retain_covariances[name])
+                if contraction_diagnostics:
+                    info["contraction_components"] = component_profile(
+                        comps, {"forget": restriction_source[name], "retain": grad_retain[name]}, contrast)
+                if weight_contraction is not None:
+                    generator = torch.Generator().manual_seed(int(component_seed) * 1000003 + zlib.crc32(name.encode()))
+                    score = (forget_retain_score(comps, restriction_source[name], grad_retain[name])
+                             if weight_contraction == "forget_retain"
+                             else contrast if weight_contraction == "contrast" else None)
+                    beta = contraction_beta(comps["kappa"], weight_contraction, 1.0 - floors[name], contraction_strength,
+                                            generator, residual=contraction_residual, score=score)
+                    info["contraction"] = contraction_report(comps["kappa"], beta, contraction_strength, contrast,
+                                                             residual=contraction_residual)
+                    info["contraction"].update({"mode": weight_contraction, "strength": contraction_strength,
+                                                "residual": contraction_residual, "budget": 1.0 - floors[name],
+                                                "budget_reached": info["contraction"]["energy_fraction"]
+                                                >= (1.0 - floors[name]) ** 2 * (1.0 - 1e-9),
+                                                "recast_update_norm": float(delta.norm())})
+                    delta = contraction_delta(comps, beta).to(delta.dtype)
+                if output_diagnostics:  # every SVD ordering at the ReCAST displacement, beta 1, without applying it
+                    sims = {}
+                    for mode in CONTRACTION_MODES:
+                        gen = torch.Generator().manual_seed(int(component_seed) * 1000003 + zlib.crc32(name.encode()))
+                        sc = (forget_retain_score(comps, restriction_source[name], grad_retain[name])
+                              if mode == "forget_retain" else contrast if mode == "contrast" else None)
+                        b = contraction_beta(comps["kappa"], mode, 1.0 - floors[name], 1.0, gen, score=sc)
+                        sims[mode] = output_energy_report(w32, contraction_delta(comps, b), forget_covariances[name],
+                                                          retain_covariances[name])
+                    info["output_energy_svd"] = sims
+                del comps
+            if output_contrast_rho is not None and basis.active:  # same displacement as the ReCAST update it replaces
+                oc_delta, oc_report = output_contrast_contraction(w32, forget_covariances[name], retain_covariances[name],
+                                                                  output_contrast_rho, float(delta.norm()))
+                info["output_contrast_applied"] = dict(oc_report, rho=output_contrast_rho,
+                                                       recast_update_norm=float(delta.norm()))
+                delta = oc_delta.to(delta.dtype)
+            if family_contraction is not None and basis.active:  # the forget output share of the ReCAST update
+                recast_out = output_energy_report(w32, delta, forget_covariances[name], retain_covariances[name])
+                fam_delta, fam_report = family_contraction_delta(w32, forget_covariances[name], retain_covariances[name],
+                                                                 family_contraction, family_rho,
+                                                                 recast_out["forget_removed_share"])
+                info["family_contraction"] = dict(fam_report, family=family_contraction, rho=family_rho,
+                                                  recast_forget_share=recast_out["forget_removed_share"],
+                                                  recast_retain_share=recast_out["retain_removed_share"],
+                                                  recast_update_norm=float(delta.norm()))
+                delta = fam_delta.to(delta.dtype)
             if direction_weighting is not None and basis.active:
                 vh32 = basis.vh.float()
                 w_dir = direction_contrast_weights(basis.vh, forget_covariances[name], retain_covariances[name],
@@ -770,16 +1277,85 @@ def warm_start(
                 delta = filtered
             info.update({"rank": basis.rank, "total_rank": basis.total_rank, "evr": basis.evr, "active": basis.active,
                          "reason": basis.reason, "applied_norm": float(delta.norm())})
+            if basis.rank_in is not None:  # own-spectrum ranks: rank is the output side's
+                info["rank_in"] = basis.rank_in
+            if basis.active:  # ||P(W)||: with every row at the floor s, applied_norm = (1 - s) ||P(W)||
+                info["projected_weight_norm"] = float(project(w32, basis.u, basis.vh).norm())
+            if output_diagnostics and basis.active:
+                info["output_energy"] = output_energy_report(w32, delta, forget_covariances[name],
+                                                             retain_covariances[name])
+                if name.rsplit(".", 1)[-1] in ("down_proj", "o_proj"):  # the writes into the residual stream
+                    info["output_contrast"] = {
+                        f"{rho:g}": output_contrast_simulation(w32, forget_covariances[name], retain_covariances[name],
+                                                               rho, float(delta.norm()))
+                        for rho in OUTPUT_CONTRAST_RHOS}
+            if family_diagnostics and basis.active and name.rsplit(".", 1)[-1] in ("down_proj", "o_proj"):
+                applied = output_energy_report(w32, delta, forget_covariances[name], retain_covariances[name])
+                info["families"] = {"recast_forget_share": applied["forget_removed_share"],
+                                    "recast_retain_share": applied["retain_removed_share"],
+                                    **family_report(w32, forget_covariances[name], retain_covariances[name],
+                                                    restriction_source[name], grad_retain[name],
+                                                    applied["forget_removed_share"], rhos=FAMILY_RHOS)}
             if forget_output_target is not None and basis.active:
                 info["forget_output_change"] = forget_output_change(delta, w32, forget_covariances[name])
         else:
             delta = proposal
             info["applied_norm"] = float(delta.norm())
+        if global_family is not None:  # the ReCAST update only sets the budget; the family's update follows the loop
+            gen = (torch.Generator().manual_seed(int(component_seed) * 1000003 + zlib.crc32(name.encode()))
+                   if global_family_order == "random" else None)
+            family_parts[name] = target_directions(w32, forget_covariances[name], retain_covariances[name],
+                                                   restriction_source[name], grad_retain[name], global_family,
+                                                   global_family_rho, keys_generator=gen, key_alpha=global_family_alpha,
+                                                   s_gamma=global_family_s_gamma, s_min=global_family_floor,
+                                                   s_rule=global_family_s_rule,
+                                                   keep_h=global_family_s_threshold_gamma is not None)
+            info["global_family"] = {"recast_forget_energy": output_energy(delta, forget_covariances[name]),
+                                     "recast_retain_energy": output_energy(delta, retain_covariances[name]),
+                                     "recast_update_norm": float(delta.norm())}
+            report[name] = info
+            continue
         w.copy_((w32 + delta).to(w.dtype))
         info["weight_rel_change"] = float((w.detach().float() - w32).norm() / (w32.norm() + COS_EPS))
         if restricted:
             restrictions[name] = Restriction(baseline=w.detach().clone(), basis=basis)
         report[name] = info
+    if global_family is not None:
+        recast = [report[n]["global_family"] for n in family_parts]
+        if global_family_budget_unit == "share":
+            budget = sum(report[n]["global_family"]["recast_forget_energy"] / family_parts[n]["energy_f"]
+                         for n in family_parts if family_parts[n]["energy_f"] > 0)
+        else:
+            budget = sum(r["recast_forget_energy"] for r in recast)
+        per_direction = global_family_s_gamma is not None or global_family_s_rule is not None
+        sel_floor = 0.0 if per_direction else global_family_floor  # folded coefficients: beta 1
+        if global_family_s_threshold_gamma is not None:
+            selection = calibrated_selection(family_parts, budget, global_family_s_threshold_gamma,
+                                             s_min=global_family_floor, unit=global_family_budget_unit)
+        else:
+            selection = global_selection(family_parts, sel_floor, budget, unit=global_family_budget_unit)
+        selection["global"].update({
+            "family": global_family, "rho": global_family_rho, "order": global_family_order, "alpha": global_family_alpha,
+            "s_gamma": global_family_s_gamma, "s_rule": global_family_s_rule, "s_min": global_family_floor,
+            "s_threshold_gamma": global_family_s_threshold_gamma,
+            "recast_retain_energy": sum(r["recast_retain_energy"] for r in recast),
+            "recast_update_norm": math.sqrt(sum(r["recast_update_norm"] ** 2 for r in recast))})
+        for name, module in targets.items():
+            w = module.weight
+            w32 = w.detach().float().clone()
+            info, chosen = report[name], selection["per_target"][name]
+            part = family_parts.pop(name)
+            if global_family_s_threshold_gamma is not None:
+                delta = delta_from_coef(part, w32, chosen.pop("coef")).to(w32.dtype)
+            else:
+                delta = global_delta(part, w32, chosen["directions"], 1.0 - sel_floor, chosen["beta_last"]).to(w32.dtype)
+            del part
+            info["global_family"].update(chosen)
+            info["global_family"]["global"] = selection["global"]
+            info["applied_norm"] = float(delta.norm())
+            w.copy_((w32 + delta).to(w.dtype))
+            info["weight_rel_change"] = float((w.detach().float() - w32).norm() / (w32.norm() + COS_EPS))
+            restrictions[name] = Restriction(baseline=w.detach().clone(), basis=bases[name])
     return restrictions, report
 
 
